@@ -52,6 +52,7 @@ class TradeReceipt(BaseModel):
     stake_amount: float
     entry_price: float
     entry_time: datetime
+    payout: float = 0.85
 
 
 class Trade(TradeReceipt):

@@ -85,3 +85,4 @@ def test_candidate_creation():
     )
     assert candidate.direction == TradeDirection.CALL
     assert candidate.risk_score == 38.0
+

@@ -35,3 +35,4 @@ def test_log_decision(tmp_path, monkeypatch):
         assert record["asset"] == "EURUSD"
         assert record["action"] == "SKIP"
         assert record["risk_score"] == 45.5
+

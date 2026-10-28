@@ -165,3 +165,4 @@ def test_window_lengths_non_positive_rejected(temp_config_file):
     path = temp_config_file(**{"patterns.window_lengths": [30, -10, 60]})
     with pytest.raises(ValidationError, match="window_lengths contains non-positive value"):
         load_config(path)
+

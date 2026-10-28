@@ -30,3 +30,4 @@ def temp_config_file(tmp_path, valid_config_dict):
         return file_path
 
     return _create_config
+
