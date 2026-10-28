@@ -159,3 +159,4 @@ def test_stateful_candle_builder():
     df_1m = builder.get_candles("EURUSD", timeframe="1m")
     assert len(df_1m) == 1
     assert df_1m.iloc[0]["close"] == 1.1020
+

@@ -109,3 +109,4 @@ def test_data_recorder_integration(test_store):
     loaded = test_store.get_candles("EURUSD", "5m")
     assert len(loaded) == 1
     assert loaded.iloc[0]["close"] == 1.11
+

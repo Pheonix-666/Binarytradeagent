@@ -189,3 +189,4 @@ def test_paper_adapter_settle_tie_refunds_stake(paper_adapter):
     assert len(settled) == 1
     assert settled[0].payout_received == 100.0
     assert paper_adapter.get_balance() == 1000.0  # Full refund
+
