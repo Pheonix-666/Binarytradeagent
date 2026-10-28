@@ -55,10 +55,13 @@ levels:
   at_level_tolerance_atr: 0.5
 
 patterns:
+  timeframes: ["5m", "15m"]
   min_similarity: 60
   template_points: 64
   window_lengths: [30, 45, 60, 90]
   dtw_shortlist: 3
+  dtw_weight: 0.3              # weight of DTW in final similarity: (1-w)*corr + w*dtw
+  dtw_sakoe_chiba_radius: 6    # Sakoe-Chiba constraint band radius
   allow_trade_without_pattern: false
 
 risk:

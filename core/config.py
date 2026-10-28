@@ -144,11 +144,14 @@ class GateConfig(BaseModel):
 class PatternsConfig(BaseModel):
     """Pattern matching parameters."""
 
-    min_similarity: float = Field(ge=0, le=100)
-    template_points: int = Field(ge=8)
-    window_lengths: list[int]
-    dtw_shortlist: int = Field(ge=1)
-    allow_trade_without_pattern: bool
+    timeframes: list[str] = Field(default=["5m", "15m"])
+    min_similarity: float = Field(ge=0, le=100, default=60.0)
+    template_points: int = Field(ge=8, default=64)
+    window_lengths: list[int] = Field(default=[30, 45, 60, 90])
+    dtw_shortlist: int = Field(ge=1, default=3)
+    dtw_weight: float = Field(ge=0, le=1, default=0.3)
+    dtw_sakoe_chiba_radius: int = Field(ge=1, default=6)
+    allow_trade_without_pattern: bool = Field(default=False)
 
     @model_validator(mode="after")
     def _validate_windows(self) -> "PatternsConfig":
