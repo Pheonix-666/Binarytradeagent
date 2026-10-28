@@ -3,6 +3,33 @@ live_requires_env: LIVE_CONFIRM
 
 data:
   daily_boundary_tz: "UTC"
+  min_bar_coverage: 0.98
+  calendars:
+    forex:
+      type: "weekly_windows"
+      windows:
+        - open_day: "Sun"
+          open_time: "17:00"
+          close_day: "Fri"
+          close_time: "17:00"
+          tz: "America/New_York"
+      daily_boundary_tz: "America/New_York"
+      daily_boundary_hour: 17
+    crypto:
+      type: "always_open"
+      windows: []
+      daily_boundary_tz: "UTC"
+      daily_boundary_hour: 0
+  assets:
+    EURUSD: "forex"
+    GBPUSD: "forex"
+    USDJPY: "forex"
+    AUDUSD: "forex"
+    NZDUSD: "forex"
+    USDCAD: "forex"
+    USDCHF: "forex"
+    BTCUSD: "crypto"
+    ETHUSD: "crypto"
 
 trading:
   expiry_minutes: 30        # 15 | 30 | 60
@@ -59,6 +86,7 @@ levels:
   at_level_tolerance_atr: 0.5
 
 patterns:
+  templates_dir: "patterns/templates"
   timeframes: ["5m", "15m"]
   min_similarity: 60
   template_points: 64
@@ -78,6 +106,7 @@ risk:
   volatility_lookback_days: 30
   atr_period: 14
   session_min_samples: 20
+  stats_modes: ["paper", "demo", "live"]
   defaults:
     pattern_missing: 100.0
     untested_asset: 100.0
@@ -93,11 +122,14 @@ risk:
 paper_gate:
   min_paper_trades: 200
   min_edge_margin: 0.02
+  require_ci_lower_bound: false
 
 selection:
   correlation_lookback: 50
   correlation_min: 0.7
   rolling_window: 100
+  shrinkage_k: 50.0
+  ranking_modes: ["paper", "demo", "live"]
 
 safety:
   max_orders_per_10min: 6
@@ -119,3 +151,12 @@ alerts:
 backtest:
   default_payout: 0.85
   train_fraction: 0.7
+  target_win_rate: 0.80
+  assets: ["EURUSD", "GBPUSD", "USDJPY", "AUDUSD"]
+  starting_balance: 10000.0
+  decision_policy: "lowest_risk"  # lowest_risk | highest_similarity
+  stake_policy: "max"             # max | mid | min
+  entry_delay_bars: 1
+  slippage_atr: 0.02
+  tie_policy: "loss"              # refund | loss
+  ignore_paper_gate: true

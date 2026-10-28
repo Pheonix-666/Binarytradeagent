@@ -210,3 +210,204 @@ def test_detect_gaps():
     assert gaps[0][0] == base + timedelta(minutes=1)
     assert gaps[0][1] == base + timedelta(minutes=5)
 
+
+# ── Calendar-Aware Resampling & Gap Tests ──────────────────────────────
+
+
+def test_forex_weekend_is_not_a_gap():
+    """Forex weekend closures (Friday 17:00 NY to Sunday 17:00 NY) are NOT gaps."""
+    from core.config import CalendarConfig, CalendarWindowConfig
+    from data.candle_builder import detect_gaps
+
+    forex_cal = CalendarConfig(
+        type="weekly_windows",
+        daily_boundary_tz="America/New_York",
+        daily_boundary_hour=17,
+        windows=[
+            CalendarWindowConfig(
+                open_day="sunday",
+                open_time="17:00",
+                close_day="friday",
+                close_time="17:00",
+                tz="America/New_York",
+            )
+        ],
+    )
+
+    # Friday 2026-10-30 at 16:59 NY (20:59 UTC, market open)
+    # Market closes at 17:00 NY (21:00 UTC)
+    # Market reopens Sunday 2026-11-01 at 17:00 NY (22:00 UTC, post-DST change)
+    fri_close_utc = datetime(2026, 10, 30, 20, 59, 0, tzinfo=timezone.utc)
+    sun_open_utc = datetime(2026, 11, 1, 22, 0, 0, tzinfo=timezone.utc)
+
+    df = pd.DataFrame([
+        {"ts": fri_close_utc, "open": 1.10, "high": 1.11, "low": 1.09, "close": 1.10, "volume": 10},
+        {"ts": sun_open_utc, "open": 1.10, "high": 1.11, "low": 1.09, "close": 1.10, "volume": 10},
+    ])
+
+    gaps = detect_gaps(df, timeframe="1m", calendar=forex_cal)
+    # Across the entire weekend, expected_bars == 0, so no gap is recorded
+    assert gaps == []
+
+
+def test_crypto_missing_bars_are_gaps():
+    """For 24/7 crypto calendar, weekend missing bars ARE recorded as gaps."""
+    from core.config import CalendarConfig
+    from data.candle_builder import detect_gaps
+
+    crypto_cal = CalendarConfig(type="always_open", daily_boundary_tz="UTC", daily_boundary_hour=0)
+
+    t1 = datetime(2026, 10, 30, 21, 0, 0, tzinfo=timezone.utc)
+    t2 = datetime(2026, 10, 30, 23, 0, 0, tzinfo=timezone.utc)  # 2-hour gap
+
+    df = pd.DataFrame([
+        {"ts": t1, "open": 60000, "high": 60100, "low": 59900, "close": 60050, "volume": 5},
+        {"ts": t2, "open": 60050, "high": 60200, "low": 60000, "close": 60150, "volume": 5},
+    ])
+
+    gaps = detect_gaps(df, timeframe="1m", calendar=crypto_cal)
+    assert len(gaps) == 1
+    assert gaps[0] == (t1, t2)
+
+
+def test_daily_bar_with_one_missing_minute_emitted():
+    """A daily candle with 1 missing minute (1439/1440 = 99.9% >= 98%) IS emitted."""
+    from core.config import CalendarConfig, CalendarWindowConfig
+
+    forex_cal = CalendarConfig(
+        type="weekly_windows",
+        daily_boundary_tz="America/New_York",
+        daily_boundary_hour=17,
+        windows=[
+            CalendarWindowConfig(
+                open_day="sunday",
+                open_time="17:00",
+                close_day="friday",
+                close_time="17:00",
+                tz="America/New_York",
+            )
+        ],
+    )
+
+    # Monday 17:00 NY to Tuesday 17:00 NY in EDT (21:00 UTC Monday to 21:00 UTC Tuesday)
+    base_utc = datetime(2026, 10, 26, 21, 0, 0, tzinfo=timezone.utc)
+    # 1439 1m bars (omit minute 500)
+    records = []
+    for m in range(1440):
+        if m == 500:
+            continue
+        records.append({
+            "ts": base_utc + timedelta(minutes=m),
+            "open": 1.10, "high": 1.11, "low": 1.09, "close": 1.10, "volume": 1
+        })
+    # Add one bar at next daily boundary to close the interval
+    records.append({
+        "ts": base_utc + timedelta(minutes=1440),
+        "open": 1.10, "high": 1.11, "low": 1.09, "close": 1.10, "volume": 1
+    })
+
+    df = pd.DataFrame(records)
+    res = resample_candles(df, target_timeframe="1d", calendar=forex_cal, min_bar_coverage=0.98)
+    assert len(res) == 1
+    assert res.iloc[0]["ts"] == base_utc
+
+
+def test_daily_bar_with_5_percent_missing_is_skipped_and_recorded_as_gap():
+    """A daily candle with 5% missing minutes (95% < 98% coverage) is SKIPPED and recorded as a gap."""
+    from core.config import CalendarConfig, CalendarWindowConfig
+    from data.candle_builder import detect_gaps
+
+    forex_cal = CalendarConfig(
+        type="weekly_windows",
+        daily_boundary_tz="America/New_York",
+        daily_boundary_hour=17,
+        windows=[
+            CalendarWindowConfig(
+                open_day="sunday",
+                open_time="17:00",
+                close_day="friday",
+                close_time="17:00",
+                tz="America/New_York",
+            )
+        ],
+    )
+
+    base_utc = datetime(2026, 10, 26, 21, 0, 0, tzinfo=timezone.utc)
+    # Only 1368 bars (95.0% coverage)
+    records = []
+    for m in range(1368):
+        records.append({
+            "ts": base_utc + timedelta(minutes=m),
+            "open": 1.10, "high": 1.11, "low": 1.09, "close": 1.10, "volume": 1
+        })
+    records.append({
+        "ts": base_utc + timedelta(minutes=1440),
+        "open": 1.10, "high": 1.11, "low": 1.09, "close": 1.10, "volume": 1
+    })
+
+    df = pd.DataFrame(records)
+    res = resample_candles(df, target_timeframe="1d", calendar=forex_cal, min_bar_coverage=0.98)
+    # Skipped because 95% < 98%
+    assert res.empty
+
+    # And detect_gaps detects the missing chunk between minute 1367 and 1440
+    gaps = detect_gaps(df, timeframe="1m", calendar=forex_cal)
+    assert len(gaps) == 1
+
+
+def test_daily_bars_start_at_1700_ny_across_dst_change():
+    """Daily candle start aligns to 17:00 New York both before (EDT = 21:00 UTC) and after DST (EST = 22:00 UTC)."""
+    from core.config import CalendarConfig
+    from data.calendar import get_daily_bucket_start
+
+    cal = CalendarConfig(
+        type="weekly_windows",
+        daily_boundary_tz="America/New_York",
+        daily_boundary_hour=17,
+    )
+
+    # 1. October 2026 (Daylight Saving Time EDT, UTC-4)
+    # 17:00 EDT is 21:00 UTC
+    dt_edt = datetime(2026, 10, 20, 22, 30, 0, tzinfo=timezone.utc)
+    bucket_edt = get_daily_bucket_start(dt_edt, cal)
+    assert bucket_edt.hour == 21
+    assert bucket_edt == datetime(2026, 10, 20, 21, 0, 0, tzinfo=timezone.utc)
+
+    # 2. November 2026 (Standard Time EST, UTC-5)
+    # 17:00 EST is 22:00 UTC
+    dt_est = datetime(2026, 11, 10, 23, 30, 0, tzinfo=timezone.utc)
+    bucket_est = get_daily_bucket_start(dt_est, cal)
+    assert bucket_est.hour == 22
+    assert bucket_est == datetime(2026, 11, 10, 22, 0, 0, tzinfo=timezone.utc)
+
+
+def test_no_partial_sunday_candle():
+    """The first daily candle of the forex week starts Sunday 17:00 NY and runs 24h to Monday 17:00 NY (no 2h candle)."""
+    from core.config import CalendarConfig, CalendarWindowConfig
+    from data.calendar import expected_bars, get_daily_bucket_start
+
+    forex_cal = CalendarConfig(
+        type="weekly_windows",
+        daily_boundary_tz="America/New_York",
+        daily_boundary_hour=17,
+        windows=[
+            CalendarWindowConfig(
+                open_day="sunday",
+                open_time="17:00",
+                close_day="friday",
+                close_time="17:00",
+                tz="America/New_York",
+            )
+        ],
+    )
+
+    # Sunday 2026-10-25 at 17:00 NY (21:00 UTC)
+    sun_1700_ny = datetime(2026, 10, 25, 21, 0, 0, tzinfo=timezone.utc)
+    bucket_start = get_daily_bucket_start(sun_1700_ny, forex_cal)
+    assert bucket_start == sun_1700_ny
+
+    # Expected bars for this Sunday 17:00 NY candle is 1440 (a full 24h day!)
+    exp = expected_bars(bucket_start, "1d", forex_cal)
+    assert exp == 1440
+
+

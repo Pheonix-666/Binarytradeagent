@@ -91,6 +91,62 @@ def test_label_trend_gap_returns_insufficient_data(default_trend_cfg):
     assert label == TrendLabel.INSUFFICIENT_DATA
 
 
+def test_label_trend_forex_weekend_does_not_cause_insufficient_data(default_trend_cfg):
+    """Forex weekend closures are not expected bars, so label_trend does not report INSUFFICIENT_DATA."""
+    from datetime import datetime, timedelta, timezone
+    from core.config import CalendarConfig, CalendarWindowConfig
+
+    forex_cal = CalendarConfig(
+        type="weekly_windows",
+        daily_boundary_tz="America/New_York",
+        daily_boundary_hour=17,
+        windows=[
+            CalendarWindowConfig(
+                open_day="sunday",
+                open_time="17:00",
+                close_day="friday",
+                close_time="17:00",
+                tz="America/New_York",
+            )
+        ],
+    )
+
+    # 180 hourly bars in an uptrend, with bar 100 on Friday 16:00 NY (20:00 UTC)
+    # and bar 101 resuming on Sunday 17:00 NY (21:00 UTC)
+    times = []
+    # Friday 2026-10-23 at 20:00 UTC (16:00 NY, 1 hour before Friday 17:00 close)
+    fri_2000_utc = datetime(2026, 10, 23, 20, 0, 0, tzinfo=timezone.utc)
+    # Generate 100 bars leading up to Friday 20:00 UTC
+    for i in range(100):
+        times.append(fri_2000_utc - timedelta(hours=99 - i))
+
+    # Reopen Sunday 2026-10-25 at 21:00 UTC (17:00 NY)
+    sun_2100_utc = datetime(2026, 10, 25, 21, 0, 0, tzinfo=timezone.utc)
+    for i in range(80):
+        times.append(sun_2100_utc + timedelta(hours=i))
+
+    closes = [100.0 + i * 1.5 for i in range(180)]
+    df = pd.DataFrame({
+        "ts": times,
+        "high": [c + 0.5 for c in closes],
+        "low": [c - 0.5 for c in closes],
+        "close": closes,
+    })
+
+    # With forex calendar: weekend is not a gap -> computes UP trend successfully!
+    label = label_trend(
+        df,
+        ema_fast=default_trend_cfg.h1.ema_fast,
+        ema_slow=default_trend_cfg.h1.ema_slow,
+        adx_period=default_trend_cfg.h1.adx_period,
+        adx_min=default_trend_cfg.h1.adx_min,
+        warmup_multiplier=default_trend_cfg.h1.warmup_multiplier,
+        timeframe="1h",
+        calendar=forex_cal,
+    )
+    assert label == TrendLabel.UP
+
+
 def test_label_trend_strong_uptrend(default_trend_cfg):
     """Steady upward ramp over 180 bars (> 150 warmup) produces UP trend."""
     n = 180

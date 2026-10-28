@@ -12,7 +12,7 @@ from typing import Optional
 import pandas as pd
 
 from analysis.indicators import compute_adx, compute_ema
-from core.config import GateConfig, TrendConfig
+from core.config import CalendarConfig, GateConfig, TrendConfig
 from core.logging_setup import get_logger
 from core.models import GateResult, PatternMatch, TradeDirection, TrendLabel, TrendReport
 from data.candle_builder import detect_gaps
@@ -28,13 +28,15 @@ def label_trend(
     adx_min: float = 20.0,
     warmup_multiplier: int = 3,
     timeframe: Optional[str] = None,
+    calendar: Optional[CalendarConfig] = None,
 ) -> TrendLabel:
     """Classify the trend of a candle series as UP, DOWN, SIDEWAYS, or INSUFFICIENT_DATA.
 
     Rules (Section 6.2):
       - INSUFFICIENT_DATA:
         1. len(df) < ema_slow * warmup_multiplier (ensuring EMA and ADX are settled).
-        2. Any gap detected within the required warm-up window (the last ema_slow * warmup_multiplier bars).
+        2. Any gap detected within the required warm-up window (the last ema_slow * warmup_multiplier bars)
+           where the market was expected to be open.
       - UP: close > EMA(slow) AND EMA(fast) > EMA(slow) AND ADX >= adx_min
       - DOWN: close < EMA(slow) AND EMA(fast) < EMA(slow) AND ADX >= adx_min
       - otherwise SIDEWAYS
@@ -48,7 +50,7 @@ def label_trend(
     # Check for gaps within the last min_required_bars
     recent_df = df.tail(min_required_bars)
     if timeframe is not None:
-        gaps = detect_gaps(recent_df, timeframe)
+        gaps = detect_gaps(recent_df, timeframe, calendar=calendar)
         if gaps:
             logger.info(
                 f"Trend INSUFFICIENT_DATA: {len(gaps)} gap(s) found in last {min_required_bars} bars for {timeframe}"

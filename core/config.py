@@ -13,10 +13,32 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 # ── Nested config models ──────────────────────────────────────────────
 
 
+class CalendarWindowConfig(BaseModel):
+    """Weekly trading window definition."""
+
+    open_day: str = "Sun"
+    open_time: str = "17:00"
+    close_day: str = "Fri"
+    close_time: str = "17:00"
+    tz: str = "America/New_York"
+
+
+class CalendarConfig(BaseModel):
+    """Market calendar configuration."""
+
+    type: Literal["always_open", "weekly_windows"] = "always_open"
+    windows: list[CalendarWindowConfig] = Field(default_factory=list)
+    daily_boundary_tz: str = "UTC"
+    daily_boundary_hour: int = Field(ge=0, le=23, default=0)
+
+
 class DataConfig(BaseModel):
     """Market data parameters."""
 
     daily_boundary_tz: str = "UTC"
+    min_bar_coverage: float = Field(ge=0.5, le=1.0, default=0.98)
+    calendars: dict[str, CalendarConfig] = Field(default_factory=dict)
+    assets: dict[str, str] = Field(default_factory=dict)
 
 
 class TradingConfig(BaseModel):
@@ -146,6 +168,7 @@ class GateConfig(BaseModel):
 class PatternsConfig(BaseModel):
     """Pattern matching parameters."""
 
+    templates_dir: str = Field(default="patterns/templates")
     timeframes: list[str] = Field(default=["5m", "15m"])
     min_similarity: float = Field(ge=0, le=100, default=60.0)
     template_points: int = Field(ge=8, default=64)
@@ -208,6 +231,7 @@ class RiskConfig(BaseModel):
     volatility_lookback_days: int = Field(ge=1, default=30)
     atr_period: int = Field(ge=2, default=14)
     session_min_samples: int = Field(ge=1, default=20)
+    stats_modes: list[str] = Field(default_factory=lambda: ["paper", "demo", "live"])
     defaults: RiskDefaultsConfig = Field(default_factory=RiskDefaultsConfig)
     sr_distance_min_atr: float = Field(gt=0, default=0.5)
     sr_distance_max_atr: float = Field(gt=0, default=3.0)
@@ -227,8 +251,9 @@ class RiskConfig(BaseModel):
 class PaperGateConfig(BaseModel):
     """Paper-trading graduation gate."""
 
-    min_paper_trades: int = Field(ge=1)
-    min_edge_margin: float = Field(gt=0, lt=1)
+    min_paper_trades: int = Field(ge=1, default=200)
+    min_edge_margin: float = Field(gt=0, lt=1, default=0.02)
+    require_ci_lower_bound: bool = Field(default=False)
 
 
 class SelectionConfig(BaseModel):
@@ -237,6 +262,8 @@ class SelectionConfig(BaseModel):
     correlation_lookback: int = Field(ge=5, default=50)
     correlation_min: float = Field(ge=0, le=1, default=0.7)
     rolling_window: int = Field(ge=10, default=100)
+    shrinkage_k: float = Field(ge=0, default=50.0)
+    ranking_modes: list[str] = Field(default_factory=lambda: ["paper", "demo", "live"])
 
 
 class SafetyConfig(BaseModel):
@@ -268,8 +295,17 @@ class AlertsConfig(BaseModel):
 class BacktestConfig(BaseModel):
     """Backtesting parameters."""
 
-    default_payout: float = Field(gt=0, lt=1)
-    train_fraction: float = Field(gt=0, lt=1)
+    default_payout: float = Field(gt=0, lt=1, default=0.85)
+    train_fraction: float = Field(gt=0, lt=1, default=0.7)
+    target_win_rate: float = Field(gt=0, le=1.0, default=0.80)
+    assets: list[str] = Field(default_factory=lambda: ["EURUSD", "GBPUSD", "USDJPY", "AUDUSD"])
+    starting_balance: float = Field(gt=0, default=10000.0)
+    decision_policy: Literal["lowest_risk", "highest_similarity"] = "lowest_risk"
+    stake_policy: Literal["max", "mid", "min"] = "max"
+    entry_delay_bars: int = Field(ge=0, default=1)
+    slippage_atr: float = Field(ge=0, default=0.02)
+    tie_policy: Literal["refund", "loss"] = "loss"
+    ignore_paper_gate: bool = Field(default=True)
 
 
 # ── Root config ───────────────────────────────────────────────────────

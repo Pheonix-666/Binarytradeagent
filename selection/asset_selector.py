@@ -21,7 +21,7 @@ import pandas as pd
 
 from core.config import AppConfig
 from core.models import AssetQuote
-from selection.stats import AssetStats, break_even, ev
+from selection.stats import AssetStats, break_even, ev, shrunk_win_rate
 
 
 @dataclass(frozen=True)
@@ -60,6 +60,7 @@ def select_top_assets(
     min_trades = config.trading.min_trades_for_stats
     top_limit = config.trading.top_assets
     max_t1_slots = config.trading.max_measured_slots
+    shrinkage_k = getattr(config.selection, "shrinkage_k", 50.0)
 
     tier1_candidates: list[dict] = []
     tier2_candidates: list[dict] = []
@@ -74,16 +75,24 @@ def select_top_assets(
         payout = quote.payout
 
         if stats and n_trades >= min_trades:
+            be_rate = stats.break_even
+            wr_adj = shrunk_win_rate(stats.wins, n_trades, be_rate, k=shrinkage_k)
+            ev_adj = ev(wr_adj, payout)
             tier1_candidates.append(
                 {
                     "asset_id": asset_id,
                     "tier": 1,
-                    "ev": stats.ev,
+                    "ev": stats.ev,  # raw EV preserved for display
+                    "ev_adj": ev_adj,
                     "win_rate": stats.win_rate,
+                    "wr_adj": wr_adj,
                     "payout": payout,
                     "trades_count": n_trades,
                     "is_otc": quote.is_otc,
-                    "reason": f"Tier 1: EV={stats.ev:+.4f}, WinRate={stats.win_rate:.1%}, n={n_trades}",
+                    "reason": (
+                        f"Tier 1: EV={stats.ev:+.4f} (shrunk={ev_adj:+.4f}), "
+                        f"WinRate={stats.win_rate:.1%} (shrunk={wr_adj:.1%}), n={n_trades}"
+                    ),
                 }
             )
         else:
@@ -102,11 +111,11 @@ def select_top_assets(
             )
 
     # Deterministic sorting
-    # Tier 1: highest EV first, then highest win rate, highest payout, alphabetical asset_id
+    # Tier 1: ranked by shrunk EV (ev_adj), then shrunk win rate (wr_adj), highest payout, alphabetical asset_id
     tier1_candidates.sort(
         key=lambda x: (
-            -float(x["ev"] if x["ev"] is not None else -999.0),
-            -float(x["win_rate"] if x["win_rate"] is not None else 0.0),
+            -float(x["ev_adj"]),
+            -float(x["wr_adj"]),
             -float(x["payout"]),
             str(x["asset_id"]),
         )

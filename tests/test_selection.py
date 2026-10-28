@@ -389,3 +389,128 @@ def test_trade_repository_crud(tmp_path):
 
     live_trades = repo.get_trades(asset="EURUSD", mode="live")
     assert len(live_trades) == 0
+
+
+# ── Shrinkage, Modes & Stricter Paper Gate Tests ───────────────────────
+
+
+def test_shrunk_win_rate_known_numbers():
+    """Small n is pulled strongly toward break-even; large n converges to raw win rate."""
+    from selection.stats import shrunk_win_rate
+
+    be = 0.54054054  # break-even for 85% payout
+    k = 50.0
+
+    # 1. Small n = 5, all 5 wins (raw win rate = 1.0)
+    # wr_adj = (5 + 50 * 0.54054054) / (5 + 50) = 32.027027 / 55 ≈ 0.582309
+    adj_small = shrunk_win_rate(wins=5, n=5, break_even_rate=be, k=k)
+    assert abs(adj_small - 0.5823) < 0.001
+    assert adj_small < 0.60  # Pulled strongly from 100% down towards ~54%
+
+    # 2. Large n = 5000, 3000 wins (raw win rate = 0.6000)
+    # wr_adj = (3000 + 50 * 0.54054054) / (5000 + 50) = 3027.027 / 5050 ≈ 0.599411
+    adj_large = shrunk_win_rate(wins=3000, n=5000, break_even_rate=be, k=k)
+    assert abs(adj_large - 0.5994) < 0.001
+    assert abs(adj_large - 0.6000) < 0.001  # Converged to raw win rate within 0.1%
+
+
+def test_select_top_assets_ranks_by_shrunk_ev(test_config):
+    """Tier 1 ranking uses shrunk EV, preventing low-n hot streaks from outranking established assets."""
+    quotes = {
+        "ASSET_HOT": AssetQuote(asset_id="ASSET_HOT", name="Hot", is_otc=False, payout=0.85, is_open=True),
+        "ASSET_SOLID": AssetQuote(asset_id="ASSET_SOLID", name="Solid", is_otc=False, payout=0.85, is_open=True),
+    }
+
+    # ASSET_HOT: n=30, wins=25 (83.3% win rate, raw EV = 0.8333 * 0.85 - 0.1667 = +0.5416)
+    # Shrunk wr = (25 + 50*0.54054) / 80 ≈ 0.6503 -> shrunk EV ≈ 0.2031
+    # ASSET_SOLID: n=200, wins=140 (70.0% win rate, raw EV = 0.70 * 0.85 - 0.30 = +0.2950)
+    # Shrunk wr = (140 + 50*0.54054) / 250 ≈ 0.6681 -> shrunk EV ≈ 0.2359
+    stats_map = {
+        "ASSET_HOT": AssetStats(
+            asset="ASSET_HOT", mode="paper", n=30, wins=25, losses=5, ties=0,
+            win_rate=0.8333, mean_payout=0.85, break_even=0.5405, ev=0.5416,
+            realized_return=0.50, wilson_ci=(0.66, 0.93), edge_label="positive_edge",
+            rolling_win_rate=0.8333, rolling_n=100,
+        ),
+        "ASSET_SOLID": AssetStats(
+            asset="ASSET_SOLID", mode="paper", n=200, wins=140, losses=60, ties=0,
+            win_rate=0.7000, mean_payout=0.85, break_even=0.5405, ev=0.2950,
+            realized_return=0.25, wilson_ci=(0.63, 0.76), edge_label="positive_edge",
+            rolling_win_rate=0.7000, rolling_n=100,
+        ),
+    }
+
+    selected = select_top_assets(quotes, stats_map, test_config)
+    # ASSET_SOLID has higher shrunk EV (0.2359 > 0.2031), so it ranks rank 1!
+    assert selected[0].asset_id == "ASSET_SOLID"
+    assert selected[1].asset_id == "ASSET_HOT"
+
+    # But raw EV is preserved in output for display
+    assert selected[0].ev == 0.2950
+    assert selected[1].ev == 0.5416
+
+
+def test_paper_gate_require_ci_lower_bound_flag(test_config):
+    """Optional stricter paper gate requires Wilson CI lower bound > break_even."""
+    be = break_even(0.85)  # ≈ 0.54054
+    # 116 wins out of 200 = 58% win rate (> 54.05% + 2% margin = 56.05%)
+    # Wilson CI for 116/200 has lower bound ≈ 0.5113 <= 0.54054
+    lower, upper = wilson_interval(116, 200)
+    assert lower < be  # CI lower bound is below break-even
+
+    stats = AssetStats(
+        asset="EURUSD", mode="paper", n=200, wins=116, losses=84, ties=0,
+        win_rate=0.58, mean_payout=0.85, break_even=be, ev=ev(0.58, 0.85),
+        realized_return=0.07, wilson_ci=(lower, upper), edge_label="unproven",
+        rolling_win_rate=0.58, rolling_n=100,
+    )
+
+    # 1. Standard gate (require_ci_lower_bound = False)
+    test_config.paper_gate.require_ci_lower_bound = False
+    mode_std, reason_std = asset_mode(stats, test_config)
+    assert mode_std == "live_eligible"
+    assert "Passed paper gate" in reason_std
+    assert f"[CI lower bound: {lower:.4f} > BE {be:.4f}: False]" in reason_std
+
+    # 2. Stricter gate (require_ci_lower_bound = True)
+    test_config.paper_gate.require_ci_lower_bound = True
+    mode_strict, reason_strict = asset_mode(stats, test_config)
+    assert mode_strict == "paper"
+    assert "CI lower bound condition failed" in reason_strict
+    assert f"[CI lower bound: {lower:.4f} > BE {be:.4f}: False]" in reason_strict
+
+
+def test_stats_modes_separation(test_config):
+    """Trade modes separation: selection and risk use configured modes; paper_gate uses paper only; backtest is never mixed."""
+    trades = [
+        # Paper trade (WIN)
+        TradeRecord(id="p1", opened_at="2026-10-29T10:00:00Z", closed_at="2026-10-29T10:30:00Z", asset="EURUSD", is_otc=False, direction="CALL", expiry_minutes=30, stake=10.0, payout_at_entry=0.85, result="WIN", pnl=8.5, mode="paper"),
+        # Demo trade (WIN)
+        TradeRecord(id="d1", opened_at="2026-10-29T10:05:00Z", closed_at="2026-10-29T10:35:00Z", asset="EURUSD", is_otc=False, direction="CALL", expiry_minutes=30, stake=10.0, payout_at_entry=0.85, result="WIN", pnl=8.5, mode="demo"),
+        # Live trade (LOSS)
+        TradeRecord(id="l1", opened_at="2026-10-29T10:10:00Z", closed_at="2026-10-29T10:40:00Z", asset="EURUSD", is_otc=False, direction="CALL", expiry_minutes=30, stake=10.0, payout_at_entry=0.85, result="LOSS", pnl=-10.0, mode="live"),
+        # Backtest trade (WIN) - must NEVER be mixed with live/demo/paper!
+        TradeRecord(id="b1", opened_at="2026-10-29T10:15:00Z", closed_at="2026-10-29T10:45:00Z", asset="EURUSD", is_otc=False, direction="CALL", expiry_minutes=30, stake=10.0, payout_at_entry=0.85, result="WIN", pnl=8.5, mode="backtest"),
+    ]
+
+    # 1. Ranking modes from config: ["paper", "demo", "live"]
+    ranking_modes = test_config.selection.ranking_modes
+    assert "backtest" not in ranking_modes
+    ranking_stats = compute_asset_stats(trades, asset="EURUSD", mode=ranking_modes)
+    assert ranking_stats.n == 3  # p1, d1, l1 (excludes b1)
+    assert ranking_stats.wins == 2
+    assert ranking_stats.losses == 1
+
+    # 2. Risk modes from config: ["paper", "demo", "live"]
+    risk_modes = test_config.risk.stats_modes
+    assert "backtest" not in risk_modes
+    risk_stats = compute_asset_stats(trades, asset="EURUSD", mode=risk_modes)
+    assert risk_stats.n == 3
+
+    # 3. Paper gate strictly uses "paper" mode
+    paper_stats = compute_asset_stats(trades, asset="EURUSD", mode="paper")
+    assert paper_stats.n == 1
+    assert paper_stats.wins == 1
+    assert paper_stats.mode == "paper"
+
+

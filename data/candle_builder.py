@@ -12,6 +12,9 @@ from typing import Optional
 
 import pandas as pd
 
+from core.config import CalendarConfig
+from data.calendar import expected_bars as get_expected_bars, get_daily_bucket_start, is_market_open
+
 
 TIMEFRAME_DELTAS = {
     "1m": timedelta(minutes=1),
@@ -102,6 +105,8 @@ def resample_candles(
     target_timeframe: str,
     current_time: Optional[datetime] = None,
     daily_boundary_tz: str = "UTC",
+    calendar: Optional[CalendarConfig] = None,
+    min_bar_coverage: float = 0.98,
 ) -> pd.DataFrame:
     """Resample 1-minute closed candles into higher timeframe closed candles.
 
@@ -109,11 +114,12 @@ def resample_candles(
 
     Rules:
       - Closed candles only. Partial or in-progress intervals are strictly excluded.
-      - Daily boundary alignment: If target_timeframe is '1d', boundaries are
-        aligned according to daily_boundary_tz (e.g. 'UTC' or market local).
-      - Gap handling: Periods with zero tick/candle data are not filled with
-        phantom zero bars; they are dropped. For buckets with internal missing
-        minutes, open/high/low/close are derived from all available bars.
+      - Calendar-aware coverage: expected_bars(bucket, calendar) determines the number
+        of open 1m bars in that bucket.
+      - A bar is emitted only if expected > 0 AND (present / expected) >= min_bar_coverage.
+      - Buckets where the market is closed (expected == 0) are not emitted and are not gaps.
+      - Daily boundary alignment: If target_timeframe is '1d', boundaries are aligned to
+        the calendar's daily_boundary_tz and daily_boundary_hour (e.g. 17:00 New York).
     """
     if target_timeframe not in TIMEFRAME_RULES:
         raise ValueError(
@@ -135,40 +141,59 @@ def resample_candles(
     if target_timeframe == "1m":
         return df.sort_values("ts").reset_index(drop=True)
 
-    rule = TIMEFRAME_RULES[target_timeframe]
     delta = TIMEFRAME_DELTAS[target_timeframe]
 
-    # Convert to daily_boundary_tz if daily timeframe requested
-    if target_timeframe == "1d" and daily_boundary_tz != "UTC":
-        df["ts"] = df["ts"].dt.tz_convert(daily_boundary_tz)
+    # Assign bucket timestamps
+    if target_timeframe == "1d":
+        if calendar is not None and (calendar.daily_boundary_hour != 0 or calendar.daily_boundary_tz != "UTC"):
+            df["bucket"] = df["ts"].apply(lambda t: get_daily_bucket_start(t, calendar))
+        elif daily_boundary_tz != "UTC":
+            # Backward-compatibility for daily_boundary_tz argument without calendar
+            df["ts_local"] = df["ts"].dt.tz_convert(daily_boundary_tz)
+            df["bucket"] = df["ts_local"].dt.floor("1D").dt.tz_convert(timezone.utc)
+        else:
+            df["bucket"] = df["ts"].dt.floor("1D")
+    else:
+        rule_str = TIMEFRAME_RULES[target_timeframe]
+        df["bucket"] = df["ts"].dt.floor(rule_str)
 
-    df = df.set_index("ts").sort_index()
+    # Group by bucket and compute OHLCV
+    rows = []
+    for bucket_start, group in df.groupby("bucket"):
+        if bucket_start.tzinfo is None:
+            b_utc = bucket_start.replace(tzinfo=timezone.utc)
+        else:
+            b_utc = bucket_start.astimezone(timezone.utc)
 
-    # Rule: Never build a resampled candle from an incomplete set of lower-timeframe bars.
-    # Count component 1m bars in each bucket
-    expected_bars = int(delta / timedelta(minutes=1))
-    counts = df.resample(rule, label="left", closed="left")["close"].count()
+        present_count = len(group)
+        expected = get_expected_bars(b_utc, target_timeframe, calendar)
 
-    resampled = df.resample(rule, label="left", closed="left").agg(
-        {
-            "open": "first",
-            "high": "max",
-            "low": "min",
-            "close": "last",
-            "volume": "sum",
-        }
-    )
+        if expected <= 0:
+            continue
 
-    # Filter: Emit resampled candle ONLY if ALL component bars are present
-    full_mask = counts == expected_bars
-    resampled = resampled[full_mask].dropna(subset=["open", "close"]).reset_index()
+        coverage = float(present_count) / float(expected)
+        if coverage < min_bar_coverage:
+            continue
 
-    if target_timeframe == "1d" and daily_boundary_tz != "UTC":
-        resampled["ts"] = resampled["ts"].dt.tz_convert(timezone.utc)
-        df.index = df.index.tz_convert(timezone.utc)
+        sorted_group = group.sort_values("ts")
+        rows.append(
+            {
+                "ts": b_utc,
+                "open": float(sorted_group["open"].iloc[0]),
+                "high": float(sorted_group["high"].max()),
+                "low": float(sorted_group["low"].min()),
+                "close": float(sorted_group["close"].iloc[-1]),
+                "volume": float(sorted_group["volume"].sum()),
+            }
+        )
+
+    if not rows:
+        return pd.DataFrame(columns=["ts", "open", "high", "low", "close", "volume"])
+
+    resampled = pd.DataFrame(rows).sort_values("ts").reset_index(drop=True)
 
     # Determine end of available 1m data
-    data_end_time = df.index.max() + timedelta(minutes=1)
+    data_end_time = df["ts"].max() + timedelta(minutes=1)
 
     effective_now = current_time
     if effective_now is not None:
@@ -181,6 +206,7 @@ def resample_candles(
         cutoff = data_end_time
 
     # A bucket starting at T and spanning delta is closed if and only if T + delta <= cutoff
+    # For daily candles, delta is 24 hours (1440 minutes)
     resampled = resampled[resampled["ts"] + delta <= cutoff]
 
     return resampled.sort_values("ts").reset_index(drop=True)
@@ -189,26 +215,43 @@ def resample_candles(
 def detect_gaps(
     df: pd.DataFrame,
     timeframe: str,
+    calendar: Optional[CalendarConfig] = None,
 ) -> list[tuple[datetime, datetime]]:
-    """Scan candle DataFrame for gaps larger than the expected timeframe interval.
+    """Scan candle DataFrame for missing intervals where the market was expected to be open.
 
-    Returns list of (gap_start, gap_end) timestamps.
+    Calendar-aware rule:
+      - Only missing intervals where expected_bars(bucket, calendar) > 0 are reported as gaps.
+      - Intervals where the market is closed (e.g. forex weekends) are NOT gaps.
     """
     if len(df) < 2 or timeframe not in TIMEFRAME_DELTAS:
         return []
 
     delta = TIMEFRAME_DELTAS[timeframe]
     ts_series = pd.to_datetime(df["ts"], utc=True).sort_values()
-    diffs = ts_series.diff()
 
-    gaps = []
-    for prev_ts, curr_ts, diff in zip(ts_series.iloc[:-1], ts_series.iloc[1:], diffs.iloc[1:]):
-        if diff > delta:
-            gaps.append((prev_ts.to_pydatetime(), curr_ts.to_pydatetime()))
+    gaps: list[tuple[datetime, datetime]] = []
+
+    for prev_ts, curr_ts in zip(ts_series.iloc[:-1], ts_series.iloc[1:]):
+        if curr_ts <= prev_ts + delta:
+            continue
+
+        # There is a jump from prev_ts to curr_ts. Check if any bucket in between had expected > 0.
+        check_time = prev_ts + delta
+        gap_has_open_market = False
+
+        while check_time < curr_ts:
+            b_utc = check_time.to_pydatetime() if hasattr(check_time, "to_pydatetime") else check_time
+            if get_expected_bars(b_utc, timeframe, calendar) > 0:
+                gap_has_open_market = True
+                break
+            check_time += delta
+
+        if gap_has_open_market:
+            p_dt = prev_ts.to_pydatetime() if hasattr(prev_ts, "to_pydatetime") else prev_ts
+            c_dt = curr_ts.to_pydatetime() if hasattr(curr_ts, "to_pydatetime") else curr_ts
+            gaps.append((p_dt, c_dt))
 
     return gaps
-
-    return resampled.sort_values("ts").reset_index(drop=True)
 
 
 class CandleBuilder:

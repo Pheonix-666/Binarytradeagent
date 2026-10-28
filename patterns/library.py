@@ -298,3 +298,14 @@ class PatternLibrary:
             key=lambda x: (x.get("refined", False), x["similarity"]), reverse=True
         )
         return all_candidates
+
+
+_DEFAULT_LIBRARY: Optional[PatternLibrary] = None
+
+
+def get_pattern_library(templates_dir: Union[str, Path] = "patterns/templates") -> PatternLibrary:
+    """Return a shared singleton PatternLibrary instance."""
+    global _DEFAULT_LIBRARY
+    if _DEFAULT_LIBRARY is None:
+        _DEFAULT_LIBRARY = PatternLibrary(templates_dir=templates_dir)
+    return _DEFAULT_LIBRARY
