@@ -191,6 +191,7 @@ class PatternLibrary:
                     "direction": t.direction,
                     "type": t.pattern_type,
                     "similarity": 0.0,
+                    "refined": False,
                 }
                 for t in self.templates
             ]
@@ -203,10 +204,12 @@ class PatternLibrary:
         # 4. Rank candidates by correlation
         ranked_indices = np.argsort(corr_sims)[::-1]
         final_scores = np.copy(corr_sims)
+        is_refined = np.zeros(len(self.templates), dtype=bool)
 
         # 5. DTW refinement on top dtw_shortlist
         num_shortlist = min(dtw_shortlist, len(ranked_indices))
         for idx in ranked_indices[:num_shortlist]:
+            is_refined[idx] = True
             if corr_sims[idx] <= 0.0:
                 final_scores[idx] = 0.0
                 continue
@@ -220,17 +223,20 @@ class PatternLibrary:
                 is_flat=False,
             )
 
-        # 6. Sort all results best-first
-        sorted_order = np.argsort(final_scores)[::-1]
+        # 6. Sort results: compare like with like
+        # Refined matches are sorted best-first among themselves.
+        # Unrefined matches are sorted best-first among themselves and placed after refined.
         results = [
             {
                 "pattern": self.templates[i].name,
                 "direction": self.templates[i].direction,
                 "type": self.templates[i].pattern_type,
                 "similarity": round(float(final_scores[i]), 2),
+                "refined": bool(is_refined[i]),
             }
-            for i in sorted_order
+            for i in range(len(self.templates))
         ]
+        results.sort(key=lambda m: (m["refined"], m["similarity"]), reverse=True)
 
         return results
 
@@ -282,6 +288,8 @@ class PatternLibrary:
                     candidate["window_length"] = w_len
                     all_candidates.append(candidate)
 
-        # Sort all candidate pattern matches best-first (highest similarity first)
-        all_candidates.sort(key=lambda x: x["similarity"], reverse=True)
+        # Sort candidates comparing like with like: refined matches first, then by similarity
+        all_candidates.sort(
+            key=lambda x: (x.get("refined", False), x["similarity"]), reverse=True
+        )
         return all_candidates

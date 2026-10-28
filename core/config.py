@@ -58,6 +58,8 @@ class StakeConfig(BaseModel):
     max_pct: float = Field(gt=0, le=100)
     total_cap_pct: float = Field(gt=0, le=100)
     daily_loss_limit_pct: Optional[float] = Field(default=None)
+    min_amount: float = Field(gt=0, default=1.0)
+    round_to: float = Field(gt=0, default=1.0)
 
     @model_validator(mode="after")
     def _validate_ordering(self) -> "StakeConfig":
@@ -188,12 +190,37 @@ class RiskWeightsConfig(BaseModel):
         return self
 
 
+class RiskDefaultsConfig(BaseModel):
+    """Defaults for missing inputs in risk calculation."""
+
+    pattern_missing: float = Field(ge=0, le=100, default=100.0)
+    untested_asset: float = Field(ge=0, le=100, default=100.0)
+    session_missing: float = Field(ge=0, le=100, default=50.0)
+    no_sr_level: float = Field(ge=0, le=100, default=10.0)
+    volatility_missing: float = Field(ge=0, le=100, default=50.0)
+
+
 class RiskConfig(BaseModel):
     """Risk scoring parameters."""
 
     weights: RiskWeightsConfig
-    volatility_lookback_days: int = Field(ge=1)
-    atr_period: int = Field(ge=2)
+    volatility_lookback_days: int = Field(ge=1, default=30)
+    atr_period: int = Field(ge=2, default=14)
+    session_min_samples: int = Field(ge=1, default=20)
+    defaults: RiskDefaultsConfig = Field(default_factory=RiskDefaultsConfig)
+    sr_distance_min_atr: float = Field(gt=0, default=0.5)
+    sr_distance_max_atr: float = Field(gt=0, default=3.0)
+    sr_distance_near_score: float = Field(ge=0, le=100, default=90.0)
+    sr_distance_far_score: float = Field(ge=0, le=100, default=10.0)
+
+    @model_validator(mode="after")
+    def _validate_sr_distance_order(self) -> "RiskConfig":
+        if self.sr_distance_min_atr >= self.sr_distance_max_atr:
+            raise ValueError(
+                f"sr_distance_min_atr ({self.sr_distance_min_atr}) must be < "
+                f"sr_distance_max_atr ({self.sr_distance_max_atr})"
+            )
+        return self
 
 
 class PaperGateConfig(BaseModel):

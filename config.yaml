@@ -18,6 +18,8 @@ stake:
   max_pct: 20
   total_cap_pct: 35
   daily_loss_limit_pct: null
+  min_amount: 1.0
+  round_to: 1.0
 
 gate:
   strict_trend_gate: true
@@ -73,6 +75,17 @@ risk:
     sr_distance: 0.2
   volatility_lookback_days: 30
   atr_period: 14
+  session_min_samples: 20
+  defaults:
+    pattern_missing: 100.0
+    untested_asset: 100.0
+    session_missing: 50.0
+    no_sr_level: 10.0
+    volatility_missing: 50.0
+  sr_distance_min_atr: 0.5
+  sr_distance_max_atr: 3.0
+  sr_distance_near_score: 90.0
+  sr_distance_far_score: 10.0
 
 paper_gate:
   min_paper_trades: 200
