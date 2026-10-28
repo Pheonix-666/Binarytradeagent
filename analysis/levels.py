@@ -193,6 +193,7 @@ def get_nearest_opposing_level(
     trade_direction: TradeDirection,
     levels: list[Level],
     atr: float = 1.0,
+    at_level_atr_threshold: float = 0.5,
 ) -> dict:
     """Find nearest opposing level in the direction of the trade.
 
@@ -222,6 +223,6 @@ def get_nearest_opposing_level(
         "type": best.level_type,
         "price": best.price,
         "distance_atr": round(dist_atr, 2),
-        "is_at_level": dist_atr <= 0.5,
+        "is_at_level": dist_atr <= at_level_atr_threshold,
         "touches": best.touches,
     }

@@ -21,6 +21,7 @@ def test_load_valid_config():
     assert isinstance(cfg, AppConfig)
     assert cfg.mode == "paper"
     assert cfg.live_requires_env == "LIVE_CONFIRM"
+    assert cfg.data.daily_boundary_tz == "UTC"
     assert cfg.trading.expiry_minutes == 30
     assert cfg.trading.allowed_expiries == [15, 30, 60]
     assert cfg.stake.min_pct == 2
@@ -31,6 +32,11 @@ def test_load_valid_config():
     assert cfg.gate.reversal_mode == "off"
     assert cfg.gate.trend.ema_fast == 20
     assert cfg.gate.trend.ema_slow == 50
+    assert cfg.gate.trend.warmup_multiplier == 3
+    assert cfg.gate.reversal_bypass.sr_level_tolerance_atr == 0.5
+    assert cfg.levels.swing_left_bars == 5
+    assert cfg.levels.swing_right_bars == 2
+    assert cfg.levels.cluster_tolerance_atr == 0.5
     assert cfg.patterns.min_similarity == 60
     assert cfg.risk.volatility_lookback_days == 30
     assert cfg.paper_gate.min_paper_trades == 200

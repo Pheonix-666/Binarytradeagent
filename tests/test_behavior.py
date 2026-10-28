@@ -42,3 +42,4 @@ def test_get_confirmation_candle_direction():
 
     doji = {"open": 1.1000, "close": 1.1000}
     assert get_confirmation_candle_direction(doji) is None
+

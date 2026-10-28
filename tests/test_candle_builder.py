@@ -160,3 +160,33 @@ def test_stateful_candle_builder():
     assert len(df_1m) == 1
     assert df_1m.iloc[0]["close"] == 1.1020
 
+
+def test_resample_candles_daily_with_tz():
+    """Daily resampling respects daily_boundary_tz alignment and closes correctly."""
+    # Create 1440 1m candles for 2026-10-29 UTC
+    base = datetime(2026, 10, 29, 0, 0, 0, tzinfo=timezone.utc)
+    records = [
+        {"ts": base + timedelta(minutes=i), "open": 100.0, "high": 105.0, "low": 99.0, "close": 102.0, "volume": 1}
+        for i in range(1440)
+    ]
+    df_1m = pd.DataFrame(records)
+    res_daily = resample_candles(df_1m, target_timeframe="1d", daily_boundary_tz="UTC")
+    assert len(res_daily) == 1
+    assert res_daily.iloc[0]["ts"] == base
+
+
+def test_detect_gaps():
+    """Gap detector flags intervals where consecutive candles exceed expected interval."""
+    base = datetime(2026, 10, 29, 10, 0, 0, tzinfo=timezone.utc)
+    # Candle at 10:00, 10:01, skip 10:02-10:04, next at 10:05
+    df = pd.DataFrame([
+        {"ts": base, "open": 100, "high": 101, "low": 99, "close": 100, "volume": 1},
+        {"ts": base + timedelta(minutes=1), "open": 100, "high": 101, "low": 99, "close": 100, "volume": 1},
+        {"ts": base + timedelta(minutes=5), "open": 100, "high": 101, "low": 99, "close": 100, "volume": 1},
+    ])
+    from data.candle_builder import detect_gaps
+    gaps = detect_gaps(df, timeframe="1m")
+    assert len(gaps) == 1
+    assert gaps[0][0] == base + timedelta(minutes=1)
+    assert gaps[0][1] == base + timedelta(minutes=5)
+

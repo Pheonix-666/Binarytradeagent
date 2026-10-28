@@ -30,6 +30,7 @@ class TrendLabel(str, Enum):
     UP = "UP"
     DOWN = "DOWN"
     SIDEWAYS = "SIDEWAYS"
+    INSUFFICIENT_DATA = "INSUFFICIENT_DATA"
 
 
 class AssetQuote(BaseModel):

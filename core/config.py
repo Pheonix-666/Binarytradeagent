@@ -13,6 +13,12 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 # ── Nested config models ──────────────────────────────────────────────
 
 
+class DataConfig(BaseModel):
+    """Market data parameters."""
+
+    daily_boundary_tz: str = "UTC"
+
+
 class TradingConfig(BaseModel):
     """Trading timing and asset selection parameters."""
 
@@ -79,6 +85,7 @@ class TrendConfig(BaseModel):
     ema_slow: int = Field(ge=2)
     adx_period: int = Field(ge=2)
     adx_min: int = Field(ge=0, le=100)
+    warmup_multiplier: int = Field(default=3, ge=1)
 
     @model_validator(mode="after")
     def _validate_ema_ordering(self) -> "TrendConfig":
@@ -95,8 +102,17 @@ class ReversalBypassConfig(BaseModel):
     min_similarity: float = Field(ge=0, le=100)
     max_risk_score: float = Field(ge=0, le=100)
     require_sr_level: bool
+    sr_level_tolerance_atr: float = Field(default=0.5, gt=0)
     require_confirmation_candle: bool
     max_volatility_percentile: float = Field(ge=0, le=100)
+
+
+class LevelsConfig(BaseModel):
+    """Support and resistance level detection parameters."""
+
+    swing_left_bars: int = Field(default=5, ge=1)
+    swing_right_bars: int = Field(default=2, ge=1)
+    cluster_tolerance_atr: float = Field(default=0.5, gt=0)
 
 
 class GateConfig(BaseModel):
@@ -217,9 +233,11 @@ class AppConfig(BaseModel):
     mode: Literal["record", "paper", "demo", "live"]
     live_requires_env: str
 
+    data: DataConfig = Field(default_factory=DataConfig)
     trading: TradingConfig
     stake: StakeConfig
     gate: GateConfig
+    levels: LevelsConfig = Field(default_factory=LevelsConfig)
     patterns: PatternsConfig
     risk: RiskConfig
     paper_gate: PaperGateConfig

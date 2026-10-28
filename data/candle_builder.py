@@ -101,13 +101,19 @@ def resample_candles(
     df_1m: pd.DataFrame,
     target_timeframe: str,
     current_time: Optional[datetime] = None,
+    daily_boundary_tz: str = "UTC",
 ) -> pd.DataFrame:
     """Resample 1-minute closed candles into higher timeframe closed candles.
 
     Supported timeframes: '1m', '5m', '15m', '1h', '1d'.
 
-    Rule: Only closed candles are returned. If a target interval is partially
-    formed (e.g. only 3 out of 5 minutes elapsed in a 5m bar), it is excluded.
+    Rules:
+      - Closed candles only. Partial or in-progress intervals are strictly excluded.
+      - Daily boundary alignment: If target_timeframe is '1d', boundaries are
+        aligned according to daily_boundary_tz (e.g. 'UTC' or market local).
+      - Gap handling: Periods with zero tick/candle data are not filled with
+        phantom zero bars; they are dropped. For buckets with internal missing
+        minutes, open/high/low/close are derived from all available bars.
     """
     if target_timeframe not in TIMEFRAME_RULES:
         raise ValueError(
@@ -132,6 +138,10 @@ def resample_candles(
     rule = TIMEFRAME_RULES[target_timeframe]
     delta = TIMEFRAME_DELTAS[target_timeframe]
 
+    # Convert to daily_boundary_tz if daily timeframe requested
+    if target_timeframe == "1d" and daily_boundary_tz != "UTC":
+        df["ts"] = df["ts"].dt.tz_convert(daily_boundary_tz)
+
     df = df.set_index("ts").sort_index()
 
     resampled = df.resample(rule, label="left", closed="left").agg(
@@ -143,11 +153,14 @@ def resample_candles(
             "volume": "sum",
         }
     )
-    # Drop empty buckets (periods with no 1m data)
+    # Gap handling: Drop empty buckets (periods with zero market data)
     resampled = resampled.dropna(subset=["open", "close"]).reset_index()
 
+    if target_timeframe == "1d" and daily_boundary_tz != "UTC":
+        resampled["ts"] = resampled["ts"].dt.tz_convert(timezone.utc)
+        df.index = df.index.tz_convert(timezone.utc)
+
     # Determine end of available 1m data
-    # Each 1m bar at timestamp T is closed, meaning data exists up to T + 1m.
     data_end_time = df.index.max() + timedelta(minutes=1)
 
     effective_now = current_time
@@ -162,6 +175,31 @@ def resample_candles(
 
     # A bucket starting at T and spanning delta is closed if and only if T + delta <= cutoff
     resampled = resampled[resampled["ts"] + delta <= cutoff]
+
+    return resampled.sort_values("ts").reset_index(drop=True)
+
+
+def detect_gaps(
+    df: pd.DataFrame,
+    timeframe: str,
+) -> list[tuple[datetime, datetime]]:
+    """Scan candle DataFrame for gaps larger than the expected timeframe interval.
+
+    Returns list of (gap_start, gap_end) timestamps.
+    """
+    if len(df) < 2 or timeframe not in TIMEFRAME_DELTAS:
+        return []
+
+    delta = TIMEFRAME_DELTAS[timeframe]
+    ts_series = pd.to_datetime(df["ts"], utc=True).sort_values()
+    diffs = ts_series.diff()
+
+    gaps = []
+    for prev_ts, curr_ts, diff in zip(ts_series.iloc[:-1], ts_series.iloc[1:], diffs.iloc[1:]):
+        if diff > delta:
+            gaps.append((prev_ts.to_pydatetime(), curr_ts.to_pydatetime()))
+
+    return gaps
 
     return resampled.sort_values("ts").reset_index(drop=True)
 

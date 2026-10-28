@@ -45,21 +45,22 @@ def default_gate_cfg(default_trend_cfg):
 
 
 def test_label_trend_insufficient_bars(default_trend_cfg):
-    """If bars < ema_slow, trend must be SIDEWAYS."""
-    df = pd.DataFrame({"close": [10.0] * 30, "high": [11.0] * 30, "low": [9.0] * 30})
+    """If bars < ema_slow * warmup_multiplier (50 * 3 = 150), trend must be INSUFFICIENT_DATA."""
+    df = pd.DataFrame({"close": [10.0] * 100, "high": [11.0] * 100, "low": [9.0] * 100})
     label = label_trend(
         df,
         ema_fast=default_trend_cfg.ema_fast,
         ema_slow=default_trend_cfg.ema_slow,
         adx_period=default_trend_cfg.adx_period,
         adx_min=default_trend_cfg.adx_min,
+        warmup_multiplier=default_trend_cfg.warmup_multiplier,
     )
-    assert label == TrendLabel.SIDEWAYS
+    assert label == TrendLabel.INSUFFICIENT_DATA
 
 
 def test_label_trend_strong_uptrend(default_trend_cfg):
-    """Steady upward ramp produces close > slow, fast > slow, ADX >= 20 -> UP."""
-    n = 80
+    """Steady upward ramp over 180 bars (> 150 warmup) produces UP trend."""
+    n = 180
     closes = [100.0 + i * 1.5 for i in range(n)]
     highs = [c + 0.5 for c in closes]
     lows = [c - 0.5 for c in closes]
@@ -71,14 +72,15 @@ def test_label_trend_strong_uptrend(default_trend_cfg):
         ema_slow=default_trend_cfg.ema_slow,
         adx_period=default_trend_cfg.adx_period,
         adx_min=default_trend_cfg.adx_min,
+        warmup_multiplier=default_trend_cfg.warmup_multiplier,
     )
     assert label == TrendLabel.UP
 
 
 def test_label_trend_strong_downtrend(default_trend_cfg):
-    """Steady downward ramp produces close < slow, fast < slow, ADX >= 20 -> DOWN."""
-    n = 80
-    closes = [200.0 - i * 1.5 for i in range(n)]
+    """Steady downward ramp over 180 bars (> 150 warmup) produces DOWN trend."""
+    n = 180
+    closes = [500.0 - i * 1.5 for i in range(n)]
     highs = [c + 0.5 for c in closes]
     lows = [c - 0.5 for c in closes]
     df = pd.DataFrame({"high": highs, "low": lows, "close": closes})
@@ -89,13 +91,14 @@ def test_label_trend_strong_downtrend(default_trend_cfg):
         ema_slow=default_trend_cfg.ema_slow,
         adx_period=default_trend_cfg.adx_period,
         adx_min=default_trend_cfg.adx_min,
+        warmup_multiplier=default_trend_cfg.warmup_multiplier,
     )
     assert label == TrendLabel.DOWN
 
 
 def test_label_trend_sideways_flat_market(default_trend_cfg):
-    """Flat oscillation produces ADX < adx_min -> SIDEWAYS."""
-    n = 80
+    """Flat oscillation over 180 bars produces ADX < adx_min -> SIDEWAYS."""
+    n = 180
     closes = [100.0 + (1.0 if i % 2 == 0 else -1.0) for i in range(n)]
     highs = [c + 0.5 for c in closes]
     lows = [c - 0.5 for c in closes]
@@ -107,6 +110,7 @@ def test_label_trend_sideways_flat_market(default_trend_cfg):
         ema_slow=default_trend_cfg.ema_slow,
         adx_period=default_trend_cfg.adx_period,
         adx_min=default_trend_cfg.adx_min,
+        warmup_multiplier=default_trend_cfg.warmup_multiplier,
     )
     assert label == TrendLabel.SIDEWAYS
 
@@ -316,11 +320,24 @@ def test_gate_reversal_sr_bypass_condition_failures(default_trend_cfg):
     assert "confirmation candle direction" in res5.reason
 
 
+def test_gate_insufficient_data_skips(default_gate_cfg):
+    """Gate must SKIP with clear 'insufficient data' reason if any timeframe lacks warmup bars."""
+    trend_insufficient = TrendReport(
+        daily=TrendLabel.INSUFFICIENT_DATA,
+        hourly=TrendLabel.UP,
+        fifteen_min=TrendLabel.UP,
+    )
+    result = evaluate_gate(trend_insufficient, TradeDirection.CALL, default_gate_cfg)
+    assert result.passed is False
+    assert "insufficient data" in result.reason
+    assert "daily=INSUFFICIENT_DATA" in result.reason
+
+
 def test_trend_no_look_ahead(default_trend_cfg):
     """Trend label at time t MUST be completely identical whether future bars exist or not."""
     np.random.seed(123)
-    n_past = 70
-    n_future = 30
+    n_past = 180
+    n_future = 50
 
     closes_past = 100.0 + np.cumsum(np.random.randn(n_past))
     df_past = pd.DataFrame({
@@ -344,6 +361,7 @@ def test_trend_no_look_ahead(default_trend_cfg):
         ema_slow=default_trend_cfg.ema_slow,
         adx_period=default_trend_cfg.adx_period,
         adx_min=default_trend_cfg.adx_min,
+        warmup_multiplier=default_trend_cfg.warmup_multiplier,
     )
 
     # Label evaluated at the exact same index (slice up to n_past) in df_extended
@@ -353,6 +371,8 @@ def test_trend_no_look_ahead(default_trend_cfg):
         ema_slow=default_trend_cfg.ema_slow,
         adx_period=default_trend_cfg.adx_period,
         adx_min=default_trend_cfg.adx_min,
+        warmup_multiplier=default_trend_cfg.warmup_multiplier,
     )
 
     assert label_past == label_sliced_from_extended
+

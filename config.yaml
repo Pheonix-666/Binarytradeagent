@@ -1,6 +1,9 @@
 mode: paper                 # record | paper | demo | live
 live_requires_env: LIVE_CONFIRM
 
+data:
+  daily_boundary_tz: "UTC"
+
 trading:
   expiry_minutes: 30        # 15 | 30 | 60
   allowed_expiries: [15, 30, 60]
@@ -24,12 +27,19 @@ gate:
     ema_slow: 50
     adx_period: 14
     adx_min: 20
+    warmup_multiplier: 3       # at least 3x slow EMA period
   reversal_bypass:
     min_similarity: 80
     max_risk_score: 40
     require_sr_level: true
+    sr_level_tolerance_atr: 0.5
     require_confirmation_candle: true
     max_volatility_percentile: 90
+
+levels:
+  swing_left_bars: 5
+  swing_right_bars: 2
+  cluster_tolerance_atr: 0.5
 
 patterns:
   min_similarity: 60

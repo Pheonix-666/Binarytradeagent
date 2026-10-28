@@ -25,18 +25,22 @@ def label_trend(
     ema_slow: int = 50,
     adx_period: int = 14,
     adx_min: float = 20.0,
+    warmup_multiplier: int = 3,
 ) -> TrendLabel:
-    """Classify the trend of a candle series as UP, DOWN, or SIDEWAYS.
+    """Classify the trend of a candle series as UP, DOWN, SIDEWAYS, or INSUFFICIENT_DATA.
 
     Rules (Section 6.2):
+      - INSUFFICIENT_DATA: len(df) < ema_slow * warmup_multiplier (default 3x ema_slow)
+        ensuring EMA and ADX indicators are fully settled and stable.
       - UP: close > EMA(slow) AND EMA(fast) > EMA(slow) AND ADX >= adx_min
       - DOWN: close < EMA(slow) AND EMA(fast) < EMA(slow) AND ADX >= adx_min
       - otherwise SIDEWAYS
 
     Strict no look-ahead: Uses only closed candles up to the latest row.
     """
-    if len(df) < ema_slow:
-        return TrendLabel.SIDEWAYS
+    min_required_bars = ema_slow * warmup_multiplier
+    if len(df) < min_required_bars:
+        return TrendLabel.INSUFFICIENT_DATA
 
     fast_series = compute_ema(df["close"], period=ema_fast)
     slow_series = compute_ema(df["close"], period=ema_slow)
@@ -70,6 +74,7 @@ def analyze_trend(
         ema_slow=trend_cfg.ema_slow,
         adx_period=trend_cfg.adx_period,
         adx_min=trend_cfg.adx_min,
+        warmup_multiplier=trend_cfg.warmup_multiplier,
     )
     hourly_label = label_trend(
         hourly_df,
@@ -77,6 +82,7 @@ def analyze_trend(
         ema_slow=trend_cfg.ema_slow,
         adx_period=trend_cfg.adx_period,
         adx_min=trend_cfg.adx_min,
+        warmup_multiplier=trend_cfg.warmup_multiplier,
     )
     fifteen_label = label_trend(
         fifteen_df,
@@ -84,6 +90,7 @@ def analyze_trend(
         ema_slow=trend_cfg.ema_slow,
         adx_period=trend_cfg.adx_period,
         adx_min=trend_cfg.adx_min,
+        warmup_multiplier=trend_cfg.warmup_multiplier,
     )
 
     return TrendReport(
@@ -118,6 +125,21 @@ def evaluate_gate(
         - risk_score <= max_risk_score
         - latest confirmation candle points same direction
     """
+    # 0. Check for Insufficient Data
+    if (
+        trend.daily == TrendLabel.INSUFFICIENT_DATA
+        or trend.hourly == TrendLabel.INSUFFICIENT_DATA
+        or trend.fifteen_min == TrendLabel.INSUFFICIENT_DATA
+    ):
+        min_bars = gate_cfg.trend.ema_slow * gate_cfg.trend.warmup_multiplier
+        reason = (
+            f"Gate SKIP: insufficient data for {direction.value} "
+            f"(requires >= {min_bars} bars for stable indicators; "
+            f"daily={trend.daily.value}, 1h={trend.hourly.value}, 15m={trend.fifteen_min.value})"
+        )
+        logger.info(reason)
+        return GateResult(passed=False, direction=direction, reason=reason)
+
     # 1. Standard Strict Trend Gate Check
     if direction == TradeDirection.CALL:
         standard_pass = (
@@ -167,17 +189,21 @@ def evaluate_gate(
         # Condition B: Price is at support (for CALL) or resistance (for PUT)
         required_level_type = "support" if direction == TradeDirection.CALL else "resistance"
         if bypass_cfg.require_sr_level:
+            tolerance = bypass_cfg.sr_level_tolerance_atr
             if not nearest_level:
                 fail_reasons.append(f"missing nearest {required_level_type} level")
             elif nearest_level.get("type") != required_level_type:
                 fail_reasons.append(
                     f"nearest level type {nearest_level.get('type')} != {required_level_type}"
                 )
-            elif not nearest_level.get("is_at_level", False):
-                fail_reasons.append(
-                    f"price is not at {required_level_type} level "
-                    f"(distance={nearest_level.get('distance_atr')} ATR)"
-                )
+            else:
+                dist = nearest_level.get("distance_atr", 999.0)
+                is_at = nearest_level.get("is_at_level", False) or (dist <= tolerance)
+                if not is_at:
+                    fail_reasons.append(
+                        f"price is not at {required_level_type} level "
+                        f"(distance={dist} ATR > tolerance={tolerance} ATR)"
+                    )
 
         # Condition C: Volatility percentile <= max
         if volatility_percentile is None:
@@ -187,9 +213,11 @@ def evaluate_gate(
                 f"volatility percentile {volatility_percentile} > {bypass_cfg.max_volatility_percentile}"
             )
 
-        # Condition D: Risk score <= max
+        # Condition D: Risk score <= max (computed in Phase 4 / prior to bypass)
         if risk_score is None:
-            fail_reasons.append("missing risk_score")
+            fail_reasons.append(
+                "missing risk_score (risk engine must evaluate candidate before reversal bypass)"
+            )
         elif risk_score > bypass_cfg.max_risk_score:
             fail_reasons.append(
                 f"risk score {risk_score} > {bypass_cfg.max_risk_score}"

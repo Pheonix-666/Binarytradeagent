@@ -124,3 +124,4 @@ def test_indicators_no_look_ahead():
         adx_extended["adx"].iloc[:n_past].values,
         err_msg="ADX at t changed when future data was added!",
     )
+

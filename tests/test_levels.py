@@ -89,3 +89,4 @@ def test_nearest_level_and_opposing():
     opposing_put = get_nearest_opposing_level(current_price, TradeDirection.PUT, levels, atr=atr)
     assert opposing_put["type"] == "support"
     assert opposing_put["price"] == 5.0
+
