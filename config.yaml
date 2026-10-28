@@ -1,0 +1,74 @@
+mode: paper                 # record | paper | demo | live
+live_requires_env: LIVE_CONFIRM
+
+trading:
+  expiry_minutes: 30        # 15 | 30 | 60
+  allowed_expiries: [15, 30, 60]
+  check_interval_minutes: 5
+  asset_reselect_hours: 2
+  top_assets: 5
+  max_measured_slots: 3
+  min_trades_for_stats: 30
+
+stake:
+  min_pct: 2
+  max_pct: 20
+  total_cap_pct: 35
+  daily_loss_limit_pct: null
+
+gate:
+  strict_trend_gate: true
+  reversal_mode: off           # off | sr_bypass
+  trend:
+    ema_fast: 20
+    ema_slow: 50
+    adx_period: 14
+    adx_min: 20
+  reversal_bypass:
+    min_similarity: 80
+    max_risk_score: 40
+    require_sr_level: true
+    require_confirmation_candle: true
+    max_volatility_percentile: 90
+
+patterns:
+  min_similarity: 60
+  template_points: 64
+  window_lengths: [30, 45, 60, 90]
+  dtw_shortlist: 3
+  allow_trade_without_pattern: false
+
+risk:
+  weights:
+    volatility: 0.2
+    pattern: 0.2
+    win_rate: 0.2
+    session: 0.2
+    sr_distance: 0.2
+  volatility_lookback_days: 30
+  atr_period: 14
+
+paper_gate:
+  min_paper_trades: 200
+  min_edge_margin: 0.02
+
+safety:
+  max_orders_per_10min: 6
+  stale_data_multiplier: 2
+  max_consecutive_exec_errors: 3
+  kill_file: KILL
+
+llm:
+  provider: anthropic
+  model: claude-sonnet-5-5
+  temperature: 0
+  max_tokens: 800
+  timeout_seconds: 20
+  max_decision_age_seconds: 30
+
+alerts:
+  telegram_enabled: true
+
+backtest:
+  default_payout: 0.85
+  train_fraction: 0.7

@@ -1,0 +1,1 @@
+"""Alerts package — notification channels."""
