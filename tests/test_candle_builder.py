@@ -161,18 +161,38 @@ def test_stateful_candle_builder():
     assert df_1m.iloc[0]["close"] == 1.1020
 
 
-def test_resample_candles_daily_with_tz():
-    """Daily resampling respects daily_boundary_tz alignment and closes correctly."""
-    # Create 1440 1m candles for 2026-10-29 UTC
-    base = datetime(2026, 10, 29, 0, 0, 0, tzinfo=timezone.utc)
+def test_resample_candles_to_5m_incomplete_component_bars_skipped():
+    """If a 5m bucket has only 4 1m bars (one missing in the middle), it must be SKIPPED."""
+    base = datetime(2026, 10, 29, 10, 0, 0, tzinfo=timezone.utc)
+    # 1m bars at 10:00, 10:01, 10:02, and 10:04 (10:03 is missing!)
+    # Plus a bar at 10:05 to close the 5m interval
     records = [
-        {"ts": base + timedelta(minutes=i), "open": 100.0, "high": 105.0, "low": 99.0, "close": 102.0, "volume": 1}
+        {"ts": base + timedelta(minutes=0), "open": 100, "high": 101, "low": 99, "close": 100, "volume": 1},
+        {"ts": base + timedelta(minutes=1), "open": 100, "high": 101, "low": 99, "close": 100, "volume": 1},
+        {"ts": base + timedelta(minutes=2), "open": 100, "high": 101, "low": 99, "close": 100, "volume": 1},
+        # minute 3 missing!
+        {"ts": base + timedelta(minutes=4), "open": 100, "high": 101, "low": 99, "close": 100, "volume": 1},
+        {"ts": base + timedelta(minutes=5), "open": 100, "high": 101, "low": 99, "close": 100, "volume": 1},
+    ]
+    df_1m = pd.DataFrame(records)
+    res = resample_candles(df_1m, target_timeframe="5m")
+    # Bucket [10:00, 10:05) only had 4 bars out of 5 -> must NOT be emitted
+    assert res.empty
+
+
+def test_resample_candles_daily_non_utc_tz():
+    """Daily resampling under a non-UTC daily_boundary_tz aligns to that timezone's midnight."""
+    # 24 hours of 1m bars in UTC
+    base_utc = datetime(2026, 10, 29, 4, 0, 0, tzinfo=timezone.utc)  # midnight America/New_York (UTC-4)
+    records = [
+        {"ts": base_utc + timedelta(minutes=i), "open": 100.0, "high": 105.0, "low": 99.0, "close": 102.0, "volume": 1}
         for i in range(1440)
     ]
     df_1m = pd.DataFrame(records)
-    res_daily = resample_candles(df_1m, target_timeframe="1d", daily_boundary_tz="UTC")
+    res_daily = resample_candles(df_1m, target_timeframe="1d", daily_boundary_tz="America/New_York")
     assert len(res_daily) == 1
-    assert res_daily.iloc[0]["ts"] == base
+    # Boundary aligned to midnight in America/New_York (which is 04:00 UTC)
+    assert res_daily.iloc[0]["ts"] == base_utc
 
 
 def test_detect_gaps():

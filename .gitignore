@@ -1,6 +1,7 @@
 .env
 logs/
 state/
+state/playwright_profile/
 __pycache__/
 *.pyc
 .pytest_cache/

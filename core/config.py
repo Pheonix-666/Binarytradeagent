@@ -78,22 +78,30 @@ class StakeConfig(BaseModel):
         return self
 
 
-class TrendConfig(BaseModel):
-    """Trend indicator parameters."""
+class TimeframeTrendConfig(BaseModel):
+    """Trend parameters for a single timeframe (daily, h1, m15)."""
 
-    ema_fast: int = Field(ge=2)
-    ema_slow: int = Field(ge=2)
-    adx_period: int = Field(ge=2)
-    adx_min: int = Field(ge=0, le=100)
-    warmup_multiplier: int = Field(default=3, ge=1)
+    ema_fast: int = Field(ge=2, default=20)
+    ema_slow: int = Field(ge=2, default=50)
+    adx_period: int = Field(ge=2, default=14)
+    adx_min: int = Field(ge=0, le=100, default=20)
+    warmup_multiplier: int = Field(ge=1, default=3)
 
     @model_validator(mode="after")
-    def _validate_ema_ordering(self) -> "TrendConfig":
+    def _validate_ema_ordering(self) -> "TimeframeTrendConfig":
         if self.ema_fast >= self.ema_slow:
             raise ValueError(
                 f"ema_fast={self.ema_fast} must be < ema_slow={self.ema_slow}"
             )
         return self
+
+
+class TrendConfig(BaseModel):
+    """Per-timeframe trend indicator parameters."""
+
+    daily: TimeframeTrendConfig = Field(default_factory=TimeframeTrendConfig)
+    h1: TimeframeTrendConfig = Field(default_factory=TimeframeTrendConfig)
+    m15: TimeframeTrendConfig = Field(default_factory=TimeframeTrendConfig)
 
 
 class ReversalBypassConfig(BaseModel):
@@ -102,7 +110,7 @@ class ReversalBypassConfig(BaseModel):
     min_similarity: float = Field(ge=0, le=100)
     max_risk_score: float = Field(ge=0, le=100)
     require_sr_level: bool
-    sr_level_tolerance_atr: float = Field(default=0.5, gt=0)
+    sr_level_tolerance_atr: Optional[float] = Field(default=None)
     require_confirmation_candle: bool
     max_volatility_percentile: float = Field(ge=0, le=100)
 
@@ -113,6 +121,7 @@ class LevelsConfig(BaseModel):
     swing_left_bars: int = Field(default=5, ge=1)
     swing_right_bars: int = Field(default=2, ge=1)
     cluster_tolerance_atr: float = Field(default=0.5, gt=0)
+    at_level_tolerance_atr: float = Field(default=0.5, gt=0)
 
 
 class GateConfig(BaseModel):

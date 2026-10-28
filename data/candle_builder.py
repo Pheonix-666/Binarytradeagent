@@ -144,6 +144,11 @@ def resample_candles(
 
     df = df.set_index("ts").sort_index()
 
+    # Rule: Never build a resampled candle from an incomplete set of lower-timeframe bars.
+    # Count component 1m bars in each bucket
+    expected_bars = int(delta / timedelta(minutes=1))
+    counts = df.resample(rule, label="left", closed="left")["close"].count()
+
     resampled = df.resample(rule, label="left", closed="left").agg(
         {
             "open": "first",
@@ -153,8 +158,10 @@ def resample_candles(
             "volume": "sum",
         }
     )
-    # Gap handling: Drop empty buckets (periods with zero market data)
-    resampled = resampled.dropna(subset=["open", "close"]).reset_index()
+
+    # Filter: Emit resampled candle ONLY if ALL component bars are present
+    full_mask = counts == expected_bars
+    resampled = resampled[full_mask].dropna(subset=["open", "close"]).reset_index()
 
     if target_timeframe == "1d" and daily_boundary_tz != "UTC":
         resampled["ts"] = resampled["ts"].dt.tz_convert(timezone.utc)

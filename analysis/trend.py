@@ -15,6 +15,7 @@ from analysis.indicators import compute_adx, compute_ema
 from core.config import GateConfig, TrendConfig
 from core.logging_setup import get_logger
 from core.models import GateResult, PatternMatch, TradeDirection, TrendLabel, TrendReport
+from data.candle_builder import detect_gaps
 
 logger = get_logger()
 
@@ -26,12 +27,14 @@ def label_trend(
     adx_period: int = 14,
     adx_min: float = 20.0,
     warmup_multiplier: int = 3,
+    timeframe: Optional[str] = None,
 ) -> TrendLabel:
     """Classify the trend of a candle series as UP, DOWN, SIDEWAYS, or INSUFFICIENT_DATA.
 
     Rules (Section 6.2):
-      - INSUFFICIENT_DATA: len(df) < ema_slow * warmup_multiplier (default 3x ema_slow)
-        ensuring EMA and ADX indicators are fully settled and stable.
+      - INSUFFICIENT_DATA:
+        1. len(df) < ema_slow * warmup_multiplier (ensuring EMA and ADX are settled).
+        2. Any gap detected within the required warm-up window (the last ema_slow * warmup_multiplier bars).
       - UP: close > EMA(slow) AND EMA(fast) > EMA(slow) AND ADX >= adx_min
       - DOWN: close < EMA(slow) AND EMA(fast) < EMA(slow) AND ADX >= adx_min
       - otherwise SIDEWAYS
@@ -41,6 +44,24 @@ def label_trend(
     min_required_bars = ema_slow * warmup_multiplier
     if len(df) < min_required_bars:
         return TrendLabel.INSUFFICIENT_DATA
+
+    # Check for gaps within the last min_required_bars
+    recent_df = df.tail(min_required_bars)
+    if timeframe is not None:
+        gaps = detect_gaps(recent_df, timeframe)
+        if gaps:
+            logger.info(
+                f"Trend INSUFFICIENT_DATA: {len(gaps)} gap(s) found in last {min_required_bars} bars for {timeframe}"
+            )
+            return TrendLabel.INSUFFICIENT_DATA
+    elif "ts" in recent_df.columns:
+        ts = pd.to_datetime(recent_df["ts"], utc=True).sort_values()
+        diffs = ts.diff().dropna()
+        if not diffs.empty and any(diffs > diffs.min()):
+            logger.info(
+                f"Trend INSUFFICIENT_DATA: gap detected in last {min_required_bars} bars"
+            )
+            return TrendLabel.INSUFFICIENT_DATA
 
     fast_series = compute_ema(df["close"], period=ema_fast)
     slow_series = compute_ema(df["close"], period=ema_slow)
@@ -63,34 +84,37 @@ def analyze_trend(
     candles_by_tf: dict[str, pd.DataFrame],
     trend_cfg: TrendConfig,
 ) -> TrendReport:
-    """Label trends for daily, 1h, and 15m timeframes."""
+    """Label trends for daily, 1h, and 15m timeframes using per-timeframe config."""
     daily_df = candles_by_tf.get("1d", candles_by_tf.get("daily", pd.DataFrame()))
     hourly_df = candles_by_tf.get("1h", candles_by_tf.get("hourly", pd.DataFrame()))
     fifteen_df = candles_by_tf.get("15m", candles_by_tf.get("fifteen_min", pd.DataFrame()))
 
     daily_label = label_trend(
         daily_df,
-        ema_fast=trend_cfg.ema_fast,
-        ema_slow=trend_cfg.ema_slow,
-        adx_period=trend_cfg.adx_period,
-        adx_min=trend_cfg.adx_min,
-        warmup_multiplier=trend_cfg.warmup_multiplier,
+        ema_fast=trend_cfg.daily.ema_fast,
+        ema_slow=trend_cfg.daily.ema_slow,
+        adx_period=trend_cfg.daily.adx_period,
+        adx_min=trend_cfg.daily.adx_min,
+        warmup_multiplier=trend_cfg.daily.warmup_multiplier,
+        timeframe="1d",
     )
     hourly_label = label_trend(
         hourly_df,
-        ema_fast=trend_cfg.ema_fast,
-        ema_slow=trend_cfg.ema_slow,
-        adx_period=trend_cfg.adx_period,
-        adx_min=trend_cfg.adx_min,
-        warmup_multiplier=trend_cfg.warmup_multiplier,
+        ema_fast=trend_cfg.h1.ema_fast,
+        ema_slow=trend_cfg.h1.ema_slow,
+        adx_period=trend_cfg.h1.adx_period,
+        adx_min=trend_cfg.h1.adx_min,
+        warmup_multiplier=trend_cfg.h1.warmup_multiplier,
+        timeframe="1h",
     )
     fifteen_label = label_trend(
         fifteen_df,
-        ema_fast=trend_cfg.ema_fast,
-        ema_slow=trend_cfg.ema_slow,
-        adx_period=trend_cfg.adx_period,
-        adx_min=trend_cfg.adx_min,
-        warmup_multiplier=trend_cfg.warmup_multiplier,
+        ema_fast=trend_cfg.m15.ema_fast,
+        ema_slow=trend_cfg.m15.ema_slow,
+        adx_period=trend_cfg.m15.adx_period,
+        adx_min=trend_cfg.m15.adx_min,
+        warmup_multiplier=trend_cfg.m15.warmup_multiplier,
+        timeframe="15m",
     )
 
     return TrendReport(
@@ -109,6 +133,7 @@ def evaluate_gate(
     volatility_percentile: Optional[float] = None,
     risk_score: Optional[float] = None,
     confirmation_candle_direction: Optional[TradeDirection] = None,
+    at_level_tolerance_atr: float = 0.5,
 ) -> GateResult:
     """Evaluate candidate trade direction against strict trend gate and reversal bypass.
 
@@ -125,17 +150,22 @@ def evaluate_gate(
         - risk_score <= max_risk_score
         - latest confirmation candle points same direction
     """
-    # 0. Check for Insufficient Data
-    if (
-        trend.daily == TrendLabel.INSUFFICIENT_DATA
-        or trend.hourly == TrendLabel.INSUFFICIENT_DATA
-        or trend.fifteen_min == TrendLabel.INSUFFICIENT_DATA
-    ):
-        min_bars = gate_cfg.trend.ema_slow * gate_cfg.trend.warmup_multiplier
+    # 0. Check for Insufficient Data separately per timeframe
+    insufficient_tfs = []
+    if trend.daily == TrendLabel.INSUFFICIENT_DATA:
+        min_bars = gate_cfg.trend.daily.ema_slow * gate_cfg.trend.daily.warmup_multiplier
+        insufficient_tfs.append(f"daily (requires >= {min_bars} bars)")
+    if trend.hourly == TrendLabel.INSUFFICIENT_DATA:
+        min_bars = gate_cfg.trend.h1.ema_slow * gate_cfg.trend.h1.warmup_multiplier
+        insufficient_tfs.append(f"1h (requires >= {min_bars} bars)")
+    if trend.fifteen_min == TrendLabel.INSUFFICIENT_DATA:
+        min_bars = gate_cfg.trend.m15.ema_slow * gate_cfg.trend.m15.warmup_multiplier
+        insufficient_tfs.append(f"15m (requires >= {min_bars} bars)")
+
+    if insufficient_tfs:
         reason = (
-            f"Gate SKIP: insufficient data for {direction.value} "
-            f"(requires >= {min_bars} bars for stable indicators; "
-            f"daily={trend.daily.value}, 1h={trend.hourly.value}, 15m={trend.fifteen_min.value})"
+            f"Gate SKIP: insufficient data for {direction.value}: "
+            f"{', '.join(insufficient_tfs)}"
         )
         logger.info(reason)
         return GateResult(passed=False, direction=direction, reason=reason)
@@ -189,7 +219,11 @@ def evaluate_gate(
         # Condition B: Price is at support (for CALL) or resistance (for PUT)
         required_level_type = "support" if direction == TradeDirection.CALL else "resistance"
         if bypass_cfg.require_sr_level:
-            tolerance = bypass_cfg.sr_level_tolerance_atr
+            tolerance = (
+                bypass_cfg.sr_level_tolerance_atr
+                if bypass_cfg.sr_level_tolerance_atr is not None
+                else at_level_tolerance_atr
+            )
             if not nearest_level:
                 fail_reasons.append(f"missing nearest {required_level_type} level")
             elif nearest_level.get("type") != required_level_type:

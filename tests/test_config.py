@@ -30,13 +30,17 @@ def test_load_valid_config():
     assert cfg.stake.daily_loss_limit_pct is None
     assert cfg.gate.strict_trend_gate is True
     assert cfg.gate.reversal_mode == "off"
-    assert cfg.gate.trend.ema_fast == 20
-    assert cfg.gate.trend.ema_slow == 50
-    assert cfg.gate.trend.warmup_multiplier == 3
-    assert cfg.gate.reversal_bypass.sr_level_tolerance_atr == 0.5
+    assert cfg.gate.trend.daily.ema_fast == 20
+    assert cfg.gate.trend.daily.ema_slow == 50
+    assert cfg.gate.trend.daily.warmup_multiplier == 3
+    assert cfg.gate.trend.h1.ema_fast == 20
+    assert cfg.gate.trend.h1.ema_slow == 50
+    assert cfg.gate.trend.m15.ema_fast == 20
+    assert cfg.gate.trend.m15.ema_slow == 50
     assert cfg.levels.swing_left_bars == 5
     assert cfg.levels.swing_right_bars == 2
     assert cfg.levels.cluster_tolerance_atr == 0.5
+    assert cfg.levels.at_level_tolerance_atr == 0.5
     assert cfg.patterns.min_similarity == 60
     assert cfg.risk.volatility_lookback_days == 30
     assert cfg.paper_gate.min_paper_trades == 200
@@ -83,10 +87,21 @@ def test_max_measured_slots_exceeds_top_assets_rejected(temp_config_file):
 
 
 def test_ema_fast_gte_slow_rejected(temp_config_file):
-    """ema_fast >= ema_slow must be rejected."""
-    path = temp_config_file(**{"gate.trend.ema_fast": 50, "gate.trend.ema_slow": 20})
+    """ema_fast >= ema_slow must be rejected for any timeframe (daily, h1, m15)."""
+    # Daily
+    path_daily = temp_config_file(**{"gate.trend.daily.ema_fast": 50, "gate.trend.daily.ema_slow": 20})
     with pytest.raises(ValidationError, match="ema_fast=50 must be < ema_slow=20"):
-        load_config(path)
+        load_config(path_daily)
+
+    # H1
+    path_h1 = temp_config_file(**{"gate.trend.h1.ema_fast": 60, "gate.trend.h1.ema_slow": 30})
+    with pytest.raises(ValidationError, match="ema_fast=60 must be < ema_slow=30"):
+        load_config(path_h1)
+
+    # M15
+    path_m15 = temp_config_file(**{"gate.trend.m15.ema_fast": 25, "gate.trend.m15.ema_slow": 25})
+    with pytest.raises(ValidationError, match="ema_fast=25 must be < ema_slow=25"):
+        load_config(path_m15)
 
 
 def test_risk_weights_dont_sum_to_one_rejected(temp_config_file):
