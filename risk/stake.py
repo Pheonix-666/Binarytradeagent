@@ -54,33 +54,31 @@ def stake_amount(
     """Calculate position stake amount from equity and percentage.
 
     Rules:
-      - Raw amount = equity * (pct / 100).
-      - If raw amount < min_amount, return None (SKIP) rather than rounding up.
-      - Round to nearest round_to increment.
-      - If rounded amount < min_amount, return None (SKIP).
+      - Raw cap amount = equity * (pct / 100).
+      - Round DOWN to nearest round_to (floor), so the rounded stake never exceeds
+        the percentage cap.
+      - If the floored amount is below min_amount, return None (SKIP) rather
+        than rounding up.
     """
     if equity <= 0.0 or pct <= 0.0:
         return None
 
-    raw_amount = equity * (pct / 100.0)
-
-    # Strict guard: do not round up if below minimum
-    if raw_amount < min_amount:
-        return None
+    raw_cap = equity * (pct / 100.0)
 
     if round_to > 0:
-        multiplier = 1.0 / round_to
-        rounded = round(raw_amount * multiplier) / multiplier
-        # Avoid float precision artifacts (e.g. 1.000000000004)
+        # Floor to round_to increment (+1e-12 protects against micro floating point division artifacts)
+        steps = math.floor((raw_cap / round_to) + 1e-12)
+        floored = steps * round_to
         if round_to >= 1.0:
-            rounded = round(rounded, 2)
+            floored = round(floored, 2)
         else:
             decimals = int(math.ceil(-math.log10(round_to)))
-            rounded = round(rounded, decimals)
+            floored = round(floored, decimals)
     else:
-        rounded = round(raw_amount, 2)
+        floored = round(raw_cap, 2)
 
-    if rounded < min_amount:
+    # If the floored amount is below min_amount, return None (SKIP)
+    if floored < (min_amount - 1e-9):
         return None
 
-    return float(rounded)
+    return float(floored)

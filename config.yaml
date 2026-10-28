@@ -18,6 +18,8 @@ stake:
   max_pct: 20
   total_cap_pct: 35
   daily_loss_limit_pct: null
+  # NOTE: min_amount and round_to are placeholders that must be set to the platform's
+  # real minimum trade amount and increment before running in demo or live mode.
   min_amount: 1.0
   round_to: 1.0
 
@@ -81,6 +83,7 @@ risk:
     untested_asset: 100.0
     session_missing: 50.0
     no_sr_level: 10.0
+    sr_unknown: 50.0
     volatility_missing: 50.0
   sr_distance_min_atr: 0.5
   sr_distance_max_atr: 3.0
@@ -90,6 +93,11 @@ risk:
 paper_gate:
   min_paper_trades: 200
   min_edge_margin: 0.02
+
+selection:
+  correlation_lookback: 50
+  correlation_min: 0.7
+  rolling_window: 100
 
 safety:
   max_orders_per_10min: 6

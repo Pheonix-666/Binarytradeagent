@@ -197,6 +197,7 @@ class RiskDefaultsConfig(BaseModel):
     untested_asset: float = Field(ge=0, le=100, default=100.0)
     session_missing: float = Field(ge=0, le=100, default=50.0)
     no_sr_level: float = Field(ge=0, le=100, default=10.0)
+    sr_unknown: float = Field(ge=0, le=100, default=50.0)
     volatility_missing: float = Field(ge=0, le=100, default=50.0)
 
 
@@ -228,6 +229,14 @@ class PaperGateConfig(BaseModel):
 
     min_paper_trades: int = Field(ge=1)
     min_edge_margin: float = Field(gt=0, lt=1)
+
+
+class SelectionConfig(BaseModel):
+    """Asset selection and correlation parameters."""
+
+    correlation_lookback: int = Field(ge=5, default=50)
+    correlation_min: float = Field(ge=0, le=1, default=0.7)
+    rolling_window: int = Field(ge=10, default=100)
 
 
 class SafetyConfig(BaseModel):
@@ -280,6 +289,7 @@ class AppConfig(BaseModel):
     patterns: PatternsConfig
     risk: RiskConfig
     paper_gate: PaperGateConfig
+    selection: SelectionConfig = Field(default_factory=SelectionConfig)
     safety: SafetyConfig
     llm: LLMConfig
     alerts: AlertsConfig

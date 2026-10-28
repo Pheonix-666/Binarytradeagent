@@ -21,6 +21,7 @@ class TradeResult(str, Enum):
 
     WIN = "WIN"
     LOSS = "LOSS"
+    TIE = "TIE"
     PENDING = "PENDING"
 
 

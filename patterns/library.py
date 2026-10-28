@@ -244,12 +244,14 @@ class PatternLibrary:
         self,
         candles_by_tf: dict[str, pd.DataFrame],
         patterns_cfg: PatternsConfig,
+        refined_only: bool = True,
     ) -> list[dict]:
         """Find best matching patterns across configured timeframes and window lengths.
 
         Rules:
           - Uses closed candles from each timeframe in patterns_cfg.timeframes.
           - Windows with gaps are skipped (no gaps permitted).
+          - If refined_only=True (default), filters out unrefined matches.
           - Output per asset: list of {pattern, direction, type, similarity, timeframe, window_length}
             sorted best-first.
         """
@@ -287,6 +289,9 @@ class PatternLibrary:
                     candidate["timeframe"] = tf
                     candidate["window_length"] = w_len
                     all_candidates.append(candidate)
+
+        if refined_only:
+            all_candidates = [c for c in all_candidates if c.get("refined", False)]
 
         # Sort candidates comparing like with like: refined matches first, then by similarity
         all_candidates.sort(

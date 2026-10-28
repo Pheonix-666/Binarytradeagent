@@ -36,6 +36,7 @@ class RiskInput:
     payout: float
     hour_of_day_risk: Optional[float] = None
     sr_distance_atr: Optional[float] = None
+    sr_levels_known: bool = True  # False if insufficient candle history to compute levels
 
 
 @dataclass(frozen=True)
@@ -116,15 +117,20 @@ def compute_session_subscore(
 def compute_sr_distance_subscore(
     sr_distance_atr: Optional[float],
     risk_cfg: RiskConfig,
+    sr_levels_known: bool = True,
 ) -> float:
     """Compute S/R distance sub-score.
 
     Distance to nearest opposing level in trade direction:
+      - if insufficient candle history to detect levels (sr_levels_known=False) -> sr_unknown (default 50)
+      - if enough history, no opposing level found (sr_distance_atr=None) -> no_sr_level (default 10)
       - under 0.5 ATR = 90
       - 3 ATR or more = 10
       - linear between
-      - if no opposing level found -> default (10.0)
     """
+    if not sr_levels_known:
+        return float(risk_cfg.defaults.sr_unknown)
+
     if sr_distance_atr is None or math.isnan(sr_distance_atr):
         return float(risk_cfg.defaults.no_sr_level)
 
@@ -160,7 +166,11 @@ def compute_risk_score(
         risk_cfg,
     )
     s_sess = compute_session_subscore(risk_input.hour_of_day_risk, risk_cfg)
-    s_sr = compute_sr_distance_subscore(risk_input.sr_distance_atr, risk_cfg)
+    s_sr = compute_sr_distance_subscore(
+        risk_input.sr_distance_atr,
+        risk_cfg,
+        sr_levels_known=risk_input.sr_levels_known,
+    )
 
     weights = {
         "volatility": risk_cfg.weights.volatility,

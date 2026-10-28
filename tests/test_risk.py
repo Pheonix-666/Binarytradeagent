@@ -85,16 +85,16 @@ def test_max_stake_pct_clamped_at_extremes():
 
 
 def test_stake_amount_rounding_and_skip():
-    """Stake calculation rounds to increment and skips when below min_amount."""
+    """Stake calculation floors to increment (round down) and skips when below min_amount."""
     equity = 1000.0  # $1,000 equity
 
-    # 5.4% of 1000 = $54 -> rounds to 54.0 with round_to=1.0
+    # 5.4% of 1000 = $54 -> floors to 54.0 with round_to=1.0
     assert stake_amount(equity, pct=5.4, min_amount=1.0, round_to=1.0) == 54.0
 
-    # 5.6% of 1000 = $56 -> rounds to 56.0
-    assert stake_amount(equity, pct=5.6, min_amount=1.0, round_to=1.0) == 56.0
+    # 5.67% of 1000 = $56.7 -> floors down to 56.0 (never rounds up to 57.0)
+    assert stake_amount(equity, pct=5.67, min_amount=1.0, round_to=1.0) == 56.0
 
-    # Fractional round_to=0.5: 5.24% of 1000 = $52.4 -> rounds to 52.5
+    # Fractional round_to=0.5: 5.26% of 1000 = $52.6 -> floors to 52.5
     assert stake_amount(equity, pct=5.26, min_amount=1.0, round_to=0.5) == 52.5
 
     # Skip when below min_amount:
@@ -104,6 +104,24 @@ def test_stake_amount_rounding_and_skip():
     # Zero or negative inputs return None
     assert stake_amount(equity=0.0, pct=5.0) is None
     assert stake_amount(equity=100.0, pct=0.0) is None
+
+
+def test_stake_amount_property_never_exceeds_percentage_cap():
+    """Property test: for many equities, pcts, and round_to values, stake_amount/equity <= pct."""
+    equities = [50.0, 100.0, 250.0, 777.77, 1000.0, 5432.10, 10000.0]
+    pcts = [1.5, 2.0, 3.75, 5.0, 8.33, 11.09, 15.0, 20.0]
+    round_tos = [0.1, 0.5, 1.0, 2.0, 5.0, 10.0]
+    min_amount = 1.0
+
+    for eq in equities:
+        for p in pcts:
+            for r in round_tos:
+                amt = stake_amount(eq, p, min_amount=min_amount, round_to=r)
+                if amt is not None:
+                    # Floored stake must never exceed percentage cap
+                    assert amt <= eq * (p / 100.0) + 1e-9
+                    assert amt >= min_amount
+                    assert amt / eq <= (p / 100.0) + 1e-9
 
 
 def test_compute_equity():
@@ -168,7 +186,7 @@ def test_session_subscore_boundaries(default_risk_config):
 
 
 def test_sr_distance_subscore_boundaries(default_risk_config):
-    """S/R distance subscore: <=0.5 ATR -> 90; >=3.0 ATR -> 10; linear between; None -> 10."""
+    """S/R distance subscore: <=0.5 ATR -> 90; >=3.0 ATR -> 10; linear between; None -> 10; unknown -> 50."""
     # Under 0.5 ATR = 90
     assert compute_sr_distance_subscore(0.5, default_risk_config) == 90.0
     assert compute_sr_distance_subscore(0.2, default_risk_config) == 90.0
@@ -180,8 +198,46 @@ def test_sr_distance_subscore_boundaries(default_risk_config):
     # Midpoint: 1.75 ATR -> (90 + 10) / 2 = 50.0
     assert compute_sr_distance_subscore(1.75, default_risk_config) == 50.0
 
-    # Missing level -> default 10.0
-    assert compute_sr_distance_subscore(None, default_risk_config) == 10.0
+    # Enough history, but no opposing level found -> default 10.0 (no_sr_level)
+    assert compute_sr_distance_subscore(None, default_risk_config, sr_levels_known=True) == 10.0
+
+    # Insufficient history to detect levels -> default 50.0 (sr_unknown)
+    assert compute_sr_distance_subscore(None, default_risk_config, sr_levels_known=False) == 50.0
+    assert compute_sr_distance_subscore(1.0, default_risk_config, sr_levels_known=False) == 50.0
+
+
+def test_sr_unknown_vs_no_sr_level_in_risk_report(default_risk_config):
+    """Distinguish 'insufficient history' (sr_unknown=50) from 'no opposing level' (no_sr_level=10)."""
+    # 1. Enough history, no opposing level found (sr_distance_atr=None, sr_levels_known=True)
+    inp_no_level = RiskInput(
+        volatility_percentile=50.0,
+        best_pattern_similarity=80.0,
+        asset_win_rate=0.60,
+        asset_trades=50,
+        payout=0.85,
+        hour_of_day_risk=50.0,
+        sr_distance_atr=None,
+        sr_levels_known=True,
+    )
+    rep_no_level = compute_risk_score(inp_no_level, default_risk_config)
+    assert rep_no_level.sr_distance_score == 10.0
+
+    # 2. Insufficient candle history to detect levels (sr_levels_known=False)
+    inp_unknown = RiskInput(
+        volatility_percentile=50.0,
+        best_pattern_similarity=80.0,
+        asset_win_rate=0.60,
+        asset_trades=50,
+        payout=0.85,
+        hour_of_day_risk=50.0,
+        sr_distance_atr=None,
+        sr_levels_known=False,
+    )
+    rep_unknown = compute_risk_score(inp_unknown, default_risk_config)
+    assert rep_unknown.sr_distance_score == 50.0
+
+    # The unknown history report must have a higher final risk score than the clear-path report
+    assert rep_unknown.score > rep_no_level.score
 
 
 # ── Composite Risk Engine & Default Handling Tests ─────────────────────
@@ -264,3 +320,4 @@ def test_risk_engine_weight_changes_alter_result(default_risk_config):
     assert report_heavy_pattern.score < report_base.score
     assert report_heavy_session.score >= 70
     assert report_heavy_pattern.score <= 20
+

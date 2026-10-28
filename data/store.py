@@ -10,6 +10,37 @@ from typing import Optional, Union
 import pandas as pd
 
 from core.models import AssetQuote
+from dataclasses import dataclass
+
+
+@dataclass
+class TradeRecord:
+    """Persistent database record for a single trade."""
+
+    id: str
+    opened_at: str  # ISO 8601 string
+    asset: str
+    is_otc: bool
+    direction: str  # "CALL" or "PUT"
+    expiry_minutes: int
+    stake: float
+    payout_at_entry: float
+    result: str = "PENDING"  # "WIN", "LOSS", "TIE", "PENDING"
+    pnl: float = 0.0
+    mode: str = "paper"  # "paper", "demo", "live"
+    closed_at: Optional[str] = None
+    pattern_name: Optional[str] = None
+    pattern_type: Optional[str] = None
+    risk_score: Optional[int] = None
+    hour_utc: Optional[int] = None
+
+    def __post_init__(self) -> None:
+        if self.hour_utc is None and self.opened_at:
+            try:
+                dt = pd.to_datetime(self.opened_at, utc=True)
+                self.hour_utc = int(dt.hour)
+            except Exception:
+                self.hour_utc = 0
 
 
 DEFAULT_DB_PATH = Path("state") / "trades.sqlite"
@@ -72,6 +103,48 @@ class DataStore:
                 """
                 CREATE INDEX IF NOT EXISTS idx_payouts_asset_ts 
                 ON payouts (asset_id, ts)
+                """
+            )
+
+            # Trades table
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS trades (
+                    id TEXT PRIMARY KEY,
+                    opened_at TEXT NOT NULL,
+                    closed_at TEXT,
+                    asset TEXT NOT NULL,
+                    is_otc INTEGER NOT NULL,
+                    direction TEXT NOT NULL,
+                    expiry_minutes INTEGER NOT NULL,
+                    stake REAL NOT NULL,
+                    payout_at_entry REAL NOT NULL,
+                    result TEXT NOT NULL,
+                    pnl REAL DEFAULT 0.0,
+                    mode TEXT NOT NULL,
+                    pattern_name TEXT,
+                    pattern_type TEXT,
+                    risk_score INTEGER,
+                    hour_utc INTEGER NOT NULL
+                )
+                """
+            )
+            cursor.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_trades_asset_mode_closed 
+                ON trades (asset, mode, closed_at)
+                """
+            )
+            cursor.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_trades_opened_at 
+                ON trades (opened_at)
+                """
+            )
+            cursor.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_trades_mode 
+                ON trades (mode)
                 """
             )
             conn.commit()
@@ -249,3 +322,147 @@ class DataStore:
             df["is_open"] = df["is_open"].astype(bool)
 
         return df
+
+
+class TradeRepository:
+    """Repository for CRUD operations on the SQLite trades table."""
+
+    def __init__(self, data_store: DataStore):
+        self.store = data_store
+
+    def insert(self, trade: TradeRecord) -> None:
+        """Insert a new trade record."""
+        with self.store._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                INSERT OR REPLACE INTO trades (
+                    id, opened_at, closed_at, asset, is_otc, direction,
+                    expiry_minutes, stake, payout_at_entry, result, pnl,
+                    mode, pattern_name, pattern_type, risk_score, hour_utc
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    trade.id,
+                    trade.opened_at,
+                    trade.closed_at,
+                    trade.asset,
+                    1 if trade.is_otc else 0,
+                    trade.direction,
+                    trade.expiry_minutes,
+                    trade.stake,
+                    trade.payout_at_entry,
+                    trade.result,
+                    trade.pnl,
+                    trade.mode,
+                    trade.pattern_name,
+                    trade.pattern_type,
+                    trade.risk_score,
+                    trade.hour_utc if trade.hour_utc is not None else 0,
+                ),
+            )
+            conn.commit()
+
+    def update_result(
+        self,
+        trade_id: str,
+        closed_at: Union[str, datetime],
+        result: str,
+        pnl: float,
+    ) -> bool:
+        """Update closed_at, result (WIN/LOSS/TIE), and pnl for an existing trade."""
+        if isinstance(closed_at, datetime):
+            if closed_at.tzinfo is None:
+                closed_at = closed_at.replace(tzinfo=timezone.utc)
+            else:
+                closed_at = closed_at.astimezone(timezone.utc)
+            closed_str = closed_at.strftime("%Y-%m-%dT%H:%M:%SZ")
+        else:
+            closed_str = str(closed_at)
+
+        with self.store._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                UPDATE trades
+                SET closed_at = ?, result = ?, pnl = ?
+                WHERE id = ?
+                """,
+                (closed_str, result, float(pnl), trade_id),
+            )
+            conn.commit()
+            return cursor.rowcount > 0
+
+    def get_trade_by_id(self, trade_id: str) -> Optional[TradeRecord]:
+        """Fetch a single trade record by id, or None."""
+        with self.store._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM trades WHERE id = ?", (trade_id,))
+            row = cursor.fetchone()
+            if not row:
+                return None
+            return self._row_to_record(row)
+
+    def get_trades(
+        self,
+        asset: Optional[str] = None,
+        mode: Optional[str] = None,
+        since: Optional[Union[str, datetime]] = None,
+        until: Optional[Union[str, datetime]] = None,
+    ) -> list[TradeRecord]:
+        """Query trade records with optional filtering."""
+        query = "SELECT * FROM trades WHERE 1=1"
+        params: list[Union[str, int]] = []
+
+        if asset:
+            query += " AND asset = ?"
+            params.append(asset)
+        if mode:
+            query += " AND mode = ?"
+            params.append(mode)
+        if since:
+            since_str = (
+                since.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+                if isinstance(since, datetime)
+                else str(since)
+            )
+            query += " AND opened_at >= ?"
+            params.append(since_str)
+        if until:
+            until_str = (
+                until.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+                if isinstance(until, datetime)
+                else str(until)
+            )
+            query += " AND opened_at <= ?"
+            params.append(until_str)
+
+        query += " ORDER BY opened_at ASC"
+
+        with self.store._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(query, params)
+            rows = cursor.fetchall()
+            return [self._row_to_record(r) for r in rows]
+
+    @staticmethod
+    def _row_to_record(row: sqlite3.Row) -> TradeRecord:
+        return TradeRecord(
+            id=str(row["id"]),
+            opened_at=str(row["opened_at"]),
+            closed_at=str(row["closed_at"]) if row["closed_at"] else None,
+            asset=str(row["asset"]),
+            is_otc=bool(row["is_otc"]),
+            direction=str(row["direction"]),
+            expiry_minutes=int(row["expiry_minutes"]),
+            stake=float(row["stake"]),
+            payout_at_entry=float(row["payout_at_entry"]),
+            result=str(row["result"]),
+            pnl=float(row["pnl"]),
+            mode=str(row["mode"]),
+            pattern_name=str(row["pattern_name"]) if row["pattern_name"] else None,
+            pattern_type=str(row["pattern_type"]) if row["pattern_type"] else None,
+            risk_score=int(row["risk_score"]) if row["risk_score"] is not None else None,
+            hour_utc=int(row["hour_utc"]),
+        )
