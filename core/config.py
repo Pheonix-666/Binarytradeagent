@@ -284,6 +284,9 @@ class LLMConfig(BaseModel):
     max_tokens: int = Field(ge=1)
     timeout_seconds: float = Field(gt=0)
     max_decision_age_seconds: float = Field(gt=0)
+    max_price_move_atr: float = Field(gt=0, default=0.25)
+    evidence_float_tolerance: float = Field(ge=0, default=0.01)
+    max_calls_per_hour: int = Field(ge=1, default=60)
 
 
 class AlertsConfig(BaseModel):
@@ -300,12 +303,13 @@ class BacktestConfig(BaseModel):
     target_win_rate: float = Field(gt=0, le=1.0, default=0.80)
     assets: list[str] = Field(default_factory=lambda: ["EURUSD", "GBPUSD", "USDJPY", "AUDUSD"])
     starting_balance: float = Field(gt=0, default=10000.0)
-    decision_policy: Literal["lowest_risk", "highest_similarity"] = "lowest_risk"
+    decision_policy: Literal["lowest_risk", "highest_similarity", "llm"] = "lowest_risk"
     stake_policy: Literal["max", "mid", "min"] = "max"
     entry_delay_bars: int = Field(ge=0, default=1)
     slippage_atr: float = Field(ge=0, default=0.02)
     tie_policy: Literal["refund", "loss"] = "loss"
     ignore_paper_gate: bool = Field(default=True)
+    max_llm_steps: int = Field(ge=1, default=200)
 
 
 # ── Root config ───────────────────────────────────────────────────────

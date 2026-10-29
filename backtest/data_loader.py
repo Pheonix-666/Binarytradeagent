@@ -40,7 +40,7 @@ class PrecomputedAssetData:
     ts_indices: dict[str, pd.DatetimeIndex] = field(default_factory=dict)
 
     def slice_as_of(self, t: datetime) -> dict[str, pd.DataFrame]:
-        """Return causal views of candles on all timeframes with ts <= t (zero look-ahead)."""
+        """Return causal views of candles on all timeframes with ts_close <= t (zero look-ahead)."""
         if t.tzinfo is None:
             t_utc = t.replace(tzinfo=timezone.utc)
         else:
@@ -53,11 +53,12 @@ class PrecomputedAssetData:
                 continue
             idx = self.ts_indices.get(tf)
             if idx is not None:
-                # searchsorted on sorted timestamps
+                # searchsorted on sorted ts_close timestamps
                 pos = idx.searchsorted(t_utc, side="right")
                 sliced[tf] = df.iloc[:pos]
             else:
-                sliced[tf] = df[df["ts"] <= t_utc]
+                close_col = "ts_close" if "ts_close" in df.columns else "ts"
+                sliced[tf] = df[df[close_col] <= t_utc]
         return sliced
 
 
@@ -86,6 +87,10 @@ def load_history_data(
     # Parse and normalize timestamps to UTC
     df["ts"] = pd.to_datetime(df["ts"], utc=True)
     df = df.drop_duplicates(subset=["ts"]).sort_values("ts").reset_index(drop=True)
+    if "ts_close" not in df.columns:
+        df["ts_close"] = df["ts"] + timedelta(minutes=1)
+    else:
+        df["ts_close"] = pd.to_datetime(df["ts_close"], utc=True)
 
     # Validate price relationships
     invalid = df[(df["high"] < df["low"]) | (df["open"] <= 0) | (df["close"] <= 0)]
@@ -164,9 +169,9 @@ def precompute_asset_data(
 
         candles_by_tf[tf] = df
 
-    # Build DatetimeIndex for fast binary searching
+    # Build DatetimeIndex for fast binary searching (indexed by ts_close to prevent look-ahead)
     ts_indices = {
-        tf: pd.DatetimeIndex(df["ts"]) for tf, df in candles_by_tf.items() if not df.empty
+        tf: pd.DatetimeIndex(df["ts_close"]) for tf, df in candles_by_tf.items() if not df.empty
     }
 
     return PrecomputedAssetData(
@@ -229,6 +234,7 @@ def generate_synthetic_candles(
 
         records.append({
             "ts": cur_time,
+            "ts_close": cur_time + timedelta(minutes=1),
             "open": round(float(o), 5),
             "high": round(float(h), 5),
             "low": round(float(l), 5),

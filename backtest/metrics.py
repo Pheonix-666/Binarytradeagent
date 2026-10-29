@@ -84,6 +84,7 @@ class VariantMetrics:
     breakdown_by_pattern: dict[str, dict[str, Any]] = field(default_factory=dict)
     breakdown_by_hour: dict[int, dict[str, Any]] = field(default_factory=dict)
     breakdown_by_risk_bucket: dict[str, dict[str, Any]] = field(default_factory=dict)
+    void_trades: int = 0
 
 
 def binomial_survival_prob(n: int, k_req: int, p: float) -> float:
@@ -107,7 +108,8 @@ def binomial_survival_prob(n: int, k_req: int, p: float) -> float:
 
 def compute_streaks(trades: Sequence[TradeRecord]) -> StreakStats:
     """Calculate longest and average losing and winning streaks in chronological order."""
-    if not trades:
+    valid_trades = [t for t in trades if t.result not in ("VOID", "PENDING")]
+    if not valid_trades:
         return StreakStats(0, 0.0, 0, 0.0)
 
     losing_streaks: list[int] = []
@@ -116,7 +118,7 @@ def compute_streaks(trades: Sequence[TradeRecord]) -> StreakStats:
     cur_losing = 0
     cur_winning = 0
 
-    for t in trades:
+    for t in valid_trades:
         if t.result == "WIN":
             if cur_losing > 0:
                 losing_streaks.append(cur_losing)
@@ -158,9 +160,11 @@ def compute_block_statistics(
     """Calculate non-overlapping block win rates and expected vs actual hit rates.
 
     target_win_rate (default 0.80) is used for reporting only.
+    VOID trades are excluded from block win-rate evaluations.
     """
-    n_total = len(trades)
-    overall_wins = sum(1 for t in trades if t.result == "WIN")
+    valid_trades = [t for t in trades if t.result not in ("VOID", "PENDING")]
+    n_total = len(valid_trades)
+    overall_wins = sum(1 for t in valid_trades if t.result == "WIN")
     overall_p = (overall_wins / n_total) if n_total > 0 else 0.0
 
     results: dict[int, BlockStats] = {}
@@ -187,7 +191,7 @@ def compute_block_statistics(
         hits = 0
 
         for i in range(num_blocks):
-            sub_trades = trades[i * b_size : (i + 1) * b_size]
+            sub_trades = valid_trades[i * b_size : (i + 1) * b_size]
             b_wins = sum(1 for t in sub_trades if t.result == "WIN")
             b_wr = b_wins / b_size
             block_wrs.append(b_wr)
@@ -216,11 +220,15 @@ def compute_variant_metrics(
     is_test_set: bool = False,
 ) -> VariantMetrics:
     """Compute comprehensive performance metrics from trade logs."""
-    n = len(trades)
+    n_all = len(trades)
+    valid_trades = [t for t in trades if t.result not in ("VOID", "PENDING")]
+    n = len(valid_trades)
+    void_count = sum(1 for t in trades if t.result == "VOID")
+
     if n == 0:
         be = break_even(0.85)
         return VariantMetrics(
-            total_trades=0,
+            total_trades=n_all,
             wins=0,
             losses=0,
             ties=0,
@@ -234,18 +242,19 @@ def compute_variant_metrics(
             streaks=StreakStats(0, 0.0, 0, 0.0),
             blocks=compute_block_statistics([], target_win_rate=target_win_rate),
             edge_label="edge unproven",
+            void_trades=void_count,
         )
 
-    wins = sum(1 for t in trades if t.result == "WIN")
-    losses = sum(1 for t in trades if t.result == "LOSS")
-    ties = sum(1 for t in trades if t.result == "TIE")
+    wins = sum(1 for t in valid_trades if t.result == "WIN")
+    losses = sum(1 for t in valid_trades if t.result == "LOSS")
+    ties = sum(1 for t in valid_trades if t.result == "TIE")
     win_rate = wins / n
 
-    payouts = [t.payout_at_entry for t in trades]
+    payouts = [t.payout_at_entry for t in valid_trades]
     mean_payout = float(np.mean(payouts)) if payouts else 0.85
     be = break_even(mean_payout)
     ev_val = ev(win_rate, mean_payout)
-    ret = realized_return(trades)
+    ret = realized_return(valid_trades)
     ci = wilson_interval(wins, n)
 
     # Edge classification
@@ -324,7 +333,7 @@ def compute_variant_metrics(
             }
 
     return VariantMetrics(
-        total_trades=n,
+        total_trades=n_all,
         wins=wins,
         losses=losses,
         ties=ties,
@@ -344,6 +353,7 @@ def compute_variant_metrics(
         breakdown_by_pattern=by_pattern,
         breakdown_by_hour=by_hour,
         breakdown_by_risk_bucket=by_risk,
+        void_trades=void_count,
     )
 
 

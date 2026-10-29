@@ -16,7 +16,7 @@ def test_ticks_to_1m_empty():
     df_empty = pd.DataFrame(columns=["ts", "price"])
     result = ticks_to_1m(df_empty)
     assert result.empty
-    assert list(result.columns) == ["ts", "open", "high", "low", "close", "volume"]
+    assert list(result.columns) == ["ts", "ts_close", "open", "high", "low", "close", "volume"]
 
 
 def test_ticks_to_1m_partial_candle_excluded():

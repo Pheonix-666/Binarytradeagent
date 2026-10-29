@@ -22,6 +22,7 @@ from typing import Any, Mapping, Optional, Sequence
 import numpy as np
 import pandas as pd
 
+from analysis.behavior import compute_volatility_percentile
 from analysis.indicators import compute_atr
 from analysis.levels import find_swing_levels, get_nearest_level, get_nearest_opposing_level
 from analysis.trend import analyze_trend, evaluate_gate
@@ -61,26 +62,8 @@ class CandidateEvaluationResult:
     skip_reasons: list[str] = field(default_factory=list)
 
 
-def compute_volatility_percentile(
-    df_candles: pd.DataFrame,
-    atr_period: int = 14,
-    lookback_bars: int = 200,
-) -> float:
-    """Compute current ATR percentile rank (0-100) relative to recent history.
-
-    Returns 50.0 (median) if insufficient history (< 20 bars).
-    """
-    if len(df_candles) < max(20, atr_period + 5):
-        return 50.0
-
-    atr_series = compute_atr(df_candles, period=atr_period).dropna()
-    if len(atr_series) < 10:
-        return 50.0
-
-    recent_atr = atr_series.tail(lookback_bars).values
-    cur_atr = recent_atr[-1]
-    pct = float(np.sum(recent_atr <= cur_atr) / len(recent_atr) * 100.0)
-    return float(np.clip(pct, 0.0, 100.0))
+DEFAULT_FALLBACK_PAYOUT: float = 0.85
+DEFAULT_ATR_FALLBACK_FRACTION: float = 0.001  # Fallback multiplier when ATR cannot be computed or is non-positive
 
 
 def build_candidates(
@@ -113,7 +96,8 @@ def build_candidates(
         templates_dir = getattr(config.patterns, "templates_dir", "patterns/templates")
         pattern_library = get_pattern_library(templates_dir)
 
-    effective_payout = payout if (payout is not None and payout > 0.0) else 0.85
+    default_payout = getattr(config.backtest, "default_payout", DEFAULT_FALLBACK_PAYOUT)
+    effective_payout = payout if (payout is not None and payout > 0.0) else default_payout
 
     # 1. Multi-timeframe trend report
     trend_report = analyze_trend(candles_by_tf, config.gate.trend, calendar=calendar)
@@ -180,14 +164,16 @@ def build_candidates(
     # Compute ATR on 15m (fallback to 5m or ref)
     atr_source_df = df_15m if len(df_15m) >= config.risk.atr_period else ref_df
     atr_series = compute_atr(atr_source_df, period=config.risk.atr_period).dropna()
-    atr_val = float(atr_series.iloc[-1]) if not atr_series.empty else (current_price * 0.001)
+    atr_val = float(atr_series.iloc[-1]) if not atr_series.empty else (current_price * DEFAULT_ATR_FALLBACK_FRACTION)
     if atr_val <= 0.0 or np.isnan(atr_val):
-        atr_val = current_price * 0.001
+        atr_val = current_price * DEFAULT_ATR_FALLBACK_FRACTION
 
-    # Volatility percentile
+    # Volatility percentile using unified canonical function and configured lookback days
     vol_pct = compute_volatility_percentile(
         df_15m if not df_15m.empty else ref_df,
         atr_period=config.risk.atr_period,
+        lookback_days=config.risk.volatility_lookback_days,
+        timeframe_minutes=15,
     )
 
     # S/R Levels

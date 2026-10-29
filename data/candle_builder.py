@@ -13,7 +13,12 @@ from typing import Optional
 import pandas as pd
 
 from core.config import CalendarConfig
-from data.calendar import expected_bars as get_expected_bars, get_daily_bucket_start, is_market_open
+from data.calendar import (
+    expected_bars as get_expected_bars,
+    get_daily_bucket_end,
+    get_daily_bucket_start,
+    is_market_open,
+)
 
 
 TIMEFRAME_DELTAS = {
@@ -49,7 +54,7 @@ def ticks_to_1m(
     sorted ascending by 'ts'.
     """
     if ticks.empty:
-        return pd.DataFrame(columns=["ts", "open", "high", "low", "close", "volume"])
+        return pd.DataFrame(columns=["ts", "ts_close", "open", "high", "low", "close", "volume"])
 
     df = ticks.copy()
     if not pd.api.types.is_datetime64_any_dtype(df["ts"]):
@@ -86,18 +91,18 @@ def ticks_to_1m(
     grouped = grouped.reset_index().rename(columns={"bucket": "ts"})
 
     # Filter out partial (open) candles:
-    # A 1m candle starting at T covers [T, T + 1m).
+    # A 1m candle starting at T covers [T, T + 1m) and closes at T + 1m.
     # It is closed only if current_time >= T + 1m (or max_tick_time >= T + 1m).
     one_min = timedelta(minutes=1)
-    if effective_now is not None:
-        grouped = grouped[grouped["ts"] + one_min <= effective_now]
-    else:
-        # Without explicit current_time, the bucket containing the latest tick
-        # is only considered closed if a tick exists at or past T + 1m.
-        # Since max_tick_time is in the dataset, T + 1m <= max_tick_time
-        grouped = grouped[grouped["ts"] + one_min <= max_tick_time]
+    grouped["ts_close"] = grouped["ts"] + one_min
 
-    return grouped.sort_values("ts").reset_index(drop=True)
+    if effective_now is not None:
+        grouped = grouped[grouped["ts_close"] <= effective_now]
+    else:
+        grouped = grouped[grouped["ts_close"] <= max_tick_time]
+
+    cols = ["ts", "ts_close", "open", "high", "low", "close", "volume"]
+    return grouped[cols].sort_values("ts").reset_index(drop=True)
 
 
 def resample_candles(
@@ -114,6 +119,8 @@ def resample_candles(
 
     Rules:
       - Closed candles only. Partial or in-progress intervals are strictly excluded.
+      - ts: open timestamp of the bar.
+      - ts_close: close timestamp (bucket end).
       - Calendar-aware coverage: expected_bars(bucket, calendar) determines the number
         of open 1m bars in that bucket.
       - A bar is emitted only if expected > 0 AND (present / expected) >= min_bar_coverage.
@@ -128,7 +135,7 @@ def resample_candles(
         )
 
     if df_1m.empty:
-        return pd.DataFrame(columns=["ts", "open", "high", "low", "close", "volume"])
+        return pd.DataFrame(columns=["ts", "ts_close", "open", "high", "low", "close", "volume"])
 
     df = df_1m.copy()
     if not pd.api.types.is_datetime64_any_dtype(df["ts"]):
@@ -139,7 +146,11 @@ def resample_candles(
         df["ts"] = df["ts"].dt.tz_convert(timezone.utc)
 
     if target_timeframe == "1m":
-        return df.sort_values("ts").reset_index(drop=True)
+        if "ts_close" not in df.columns:
+            df["ts_close"] = df["ts"] + timedelta(minutes=1)
+        cols = ["ts", "ts_close", "open", "high", "low", "close", "volume"]
+        extra = [c for c in df.columns if c not in cols]
+        return df[cols + extra].sort_values("ts").reset_index(drop=True)
 
     delta = TIMEFRAME_DELTAS[target_timeframe]
 
@@ -175,10 +186,19 @@ def resample_candles(
         if coverage < min_bar_coverage:
             continue
 
+        if target_timeframe == "1d":
+            if calendar is not None:
+                b_close = get_daily_bucket_end(b_utc, calendar)
+            else:
+                b_close = b_utc + timedelta(days=1)
+        else:
+            b_close = b_utc + delta
+
         sorted_group = group.sort_values("ts")
         rows.append(
             {
                 "ts": b_utc,
+                "ts_close": b_close,
                 "open": float(sorted_group["open"].iloc[0]),
                 "high": float(sorted_group["high"].max()),
                 "low": float(sorted_group["low"].min()),
@@ -188,7 +208,7 @@ def resample_candles(
         )
 
     if not rows:
-        return pd.DataFrame(columns=["ts", "open", "high", "low", "close", "volume"])
+        return pd.DataFrame(columns=["ts", "ts_close", "open", "high", "low", "close", "volume"])
 
     resampled = pd.DataFrame(rows).sort_values("ts").reset_index(drop=True)
 
@@ -205,9 +225,8 @@ def resample_candles(
     else:
         cutoff = data_end_time
 
-    # A bucket starting at T and spanning delta is closed if and only if T + delta <= cutoff
-    # For daily candles, delta is 24 hours (1440 minutes)
-    resampled = resampled[resampled["ts"] + delta <= cutoff]
+    # A bucket starting at T is closed if and only if its close timestamp ts_close <= cutoff
+    resampled = resampled[resampled["ts_close"] <= cutoff]
 
     return resampled.sort_values("ts").reset_index(drop=True)
 

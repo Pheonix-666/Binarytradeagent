@@ -33,6 +33,9 @@ from core.config import AppConfig
 from core.logging_setup import get_logger
 from core.models import TradeDirection
 from data.store import DataStore, TradeRecord, TradeRepository
+from decision.llm_client import FakeLLMClient, LLMClient, get_llm_client
+from decision.schema import SystemState
+from decision.service import DecisionService
 from patterns.library import PatternLibrary, get_pattern_library
 from risk.stake import compute_equity, stake_amount
 from selection.stats import compute_asset_stats, hour_risk
@@ -59,6 +62,86 @@ class OpenTrade:
     evidence: dict[str, Any] = field(default_factory=dict)
 
 
+class Fast1mLookup:
+    """High-performance O(log N) 1m bar lookup using sorted DatetimeIndex searchsorted."""
+
+    def __init__(self, df_1m: pd.DataFrame):
+        if df_1m.empty or "ts" not in df_1m.columns:
+            self.ts_idx = pd.DatetimeIndex([])
+            self.open_prices = np.array([], dtype=np.float64)
+            self.close_prices = np.array([], dtype=np.float64)
+        else:
+            ts_utc = pd.to_datetime(df_1m["ts"], utc=True)
+            self.ts_idx = pd.DatetimeIndex(ts_utc)
+            self.open_prices = df_1m["open"].values.astype(np.float64)
+            self.close_prices = df_1m["close"].values.astype(np.float64)
+
+    def get_bar(self, t: datetime) -> Optional[dict[str, float]]:
+        if len(self.ts_idx) == 0:
+            return None
+        if t.tzinfo is None:
+            t_utc = t.replace(tzinfo=timezone.utc)
+        else:
+            t_utc = t.astimezone(timezone.utc)
+        pos = self.ts_idx.searchsorted(t_utc)
+        if pos < len(self.ts_idx) and self.ts_idx[pos] == t_utc:
+            return {"open": float(self.open_prices[pos]), "close": float(self.close_prices[pos])}
+        return None
+
+
+def settle_position(
+    ot: OpenTrade,
+    exit_bar: Optional[dict[str, float]],
+    tie_policy: str,
+) -> tuple[str, float, float]:
+    """Settle an open position causally.
+
+    Returns:
+        (result, pnl, cash_refund)
+        where cash_refund is the total cash added back to current balance:
+        - WIN: stake + (stake * payout)
+        - LOSS: 0.0 (stake was already deducted at entry)
+        - TIE (refund): stake
+        - TIE (loss): 0.0
+        - VOID (missing exit bar): stake (full refund)
+    """
+    if exit_bar is None:
+        return "VOID", 0.0, ot.stake
+
+    exit_price = exit_bar["close"]
+    if ot.direction == TradeDirection.CALL:
+        if exit_price > ot.entry_price:
+            result = "WIN"
+        elif exit_price < ot.entry_price:
+            result = "LOSS"
+        else:
+            result = "TIE"
+    else:  # PUT
+        if exit_price < ot.entry_price:
+            result = "WIN"
+        elif exit_price > ot.entry_price:
+            result = "LOSS"
+        else:
+            result = "TIE"
+
+    if result == "TIE":
+        if tie_policy == "refund":
+            pnl = 0.0
+            cash_refund = ot.stake
+        else:  # loss
+            result = "LOSS"
+            pnl = -ot.stake
+            cash_refund = 0.0
+    elif result == "WIN":
+        pnl = ot.stake * ot.payout
+        cash_refund = ot.stake + pnl
+    else:  # LOSS
+        pnl = -ot.stake
+        cash_refund = 0.0
+
+    return result, pnl, cash_refund
+
+
 @dataclass
 class BacktestResult:
     """Summary and trade log resulting from a completed backtest run."""
@@ -83,6 +166,7 @@ class BacktestEngine:
         data_by_asset: Mapping[str, Any],  # PrecomputedAssetData
         pattern_library: Optional[PatternLibrary] = None,
         store: Optional[DataStore] = None,
+        llm_client: Optional[LLMClient] = None,
     ):
         self.config = config
         self.data_by_asset = data_by_asset
@@ -92,6 +176,10 @@ class BacktestEngine:
         # In-memory trade repository for backtest trades
         self.store = store or DataStore(db_path=":memory:")
         self.repo = TradeRepository(self.store)
+
+        # Optional LLM client and decision service for backtest.decision_policy == 'llm'
+        self.llm_client = llm_client
+        self.decision_service = DecisionService()
 
     def run(
         self,
@@ -120,6 +208,8 @@ class BacktestEngine:
             "exposure_cap": 0,
             "opposite_direction": 0,
             "insufficient_cash": 0,
+            "data_gap_entry": 0,
+            "data_gap_exit": 0,
         }
         total_steps = 0
         peak_equity = cash
@@ -127,15 +217,18 @@ class BacktestEngine:
 
         trade_counter = 0
 
-        # Pre-build lookup map of 1m bars for fast fill simulation
-        bars_1m_by_asset: dict[str, dict[datetime, dict[str, float]]] = {}
-        for asset, p_data in self.data_by_asset.items():
-            df_1m = p_data.df_1m
-            # Map timestamp to open and close prices
-            bars_1m_by_asset[asset] = {
-                row["ts"]: {"open": float(row["open"]), "close": float(row["close"])}
-                for _, row in df_1m.iterrows()
-            }
+        if cfg.backtest.decision_policy == "llm":
+            print(
+                f"WARNING: backtest.decision_policy='llm' is active! Invoking LLM decision service "
+                f"(capped at {cfg.backtest.max_llm_steps} steps)."
+            )
+        llm_steps_called = 0
+
+        # Fast O(log N) lookup of 1m bars using numpy arrays
+        fast_lookup_by_asset = {
+            asset: Fast1mLookup(p_data.df_1m)
+            for asset, p_data in self.data_by_asset.items()
+        }
 
         cur_t = start_t
         while cur_t <= end_t:
@@ -145,43 +238,12 @@ class BacktestEngine:
             remaining_open: list[OpenTrade] = []
             for ot in open_trades:
                 if ot.exit_time <= cur_t:
-                    # Settle trade
-                    bars_map = bars_1m_by_asset.get(ot.asset, {})
-                    exit_bar = bars_map.get(ot.exit_time)
-                    if exit_bar is not None:
-                        exit_price = exit_bar["close"]
-                    else:
-                        # Fallback to latest available bar up to exit_time
-                        exit_price = ot.entry_price
-
-                    # Determine outcome
-                    if ot.direction == TradeDirection.CALL:
-                        if exit_price > ot.entry_price:
-                            result = "WIN"
-                        elif exit_price < ot.entry_price:
-                            result = "LOSS"
-                        else:
-                            result = "TIE"
-                    else:  # PUT
-                        if exit_price < ot.entry_price:
-                            result = "WIN"
-                        elif exit_price > ot.entry_price:
-                            result = "LOSS"
-                        else:
-                            result = "TIE"
-
-                    if result == "TIE":
-                        if cfg.backtest.tie_policy == "refund":
-                            pnl = 0.0
-                            cash += ot.stake
-                        else:  # "loss"
-                            result = "LOSS"
-                            pnl = -ot.stake
-                    elif result == "WIN":
-                        pnl = ot.stake * ot.payout
-                        cash += ot.stake + pnl
-                    else:  # LOSS
-                        pnl = -ot.stake
+                    lookup = fast_lookup_by_asset.get(ot.asset)
+                    exit_bar = lookup.get_bar(ot.exit_time) if lookup else None
+                    result, pnl, cash_refund = settle_position(ot, exit_bar, cfg.backtest.tie_policy)
+                    if result == "VOID":
+                        skip_counts["data_gap_exit"] += 1
+                    cash += cash_refund
 
                     # Update database record
                     self.repo.update_result(
@@ -230,6 +292,9 @@ class BacktestEngine:
             )
 
             # 4. Evaluate candidates for each asset
+            step_candidates: list[CandidateTrade] = []
+            candidates_by_asset: dict[str, list[CandidateTrade]] = {}
+
             for asset, p_data in self.data_by_asset.items():
                 sliced_candles = p_data.slice_as_of(cur_t)
                 payout = getattr(cfg.backtest, "default_payout", 0.85)
@@ -255,140 +320,231 @@ class BacktestEngine:
                     elif "gate" in r:
                         skip_counts["gate"] += 1
 
-                if not eval_result.candidates:
-                    continue
+                if eval_result.candidates:
+                    step_candidates.extend(eval_result.candidates)
+                    candidates_by_asset[asset] = eval_result.candidates
 
-                # Decision policy: choose 1 candidate for this asset
-                if cfg.backtest.decision_policy == "highest_similarity":
-                    eval_result.candidates.sort(
-                        key=lambda c: (
-                            -float(c.pattern_match.similarity),
-                            float(c.risk_report.score),
-                        )
+            # Select and commit trades according to decision_policy
+            if cfg.backtest.decision_policy == "llm":
+                if step_candidates and llm_steps_called < cfg.backtest.max_llm_steps and self.llm_client is not None:
+                    llm_steps_called += 1
+                    curr_prices = {}
+                    for a, p_d in self.data_by_asset.items():
+                        m1 = p_d.slice_as_of(cur_t).get("1m")
+                        if m1 is not None and not m1.empty:
+                            curr_prices[a] = float(m1["close"].iloc[-1])
+
+                    state = SystemState(
+                        kill_switch_active=False,
+                        breaker_tripped=False,
+                        reconcile_done=True,
+                        current_prices=curr_prices,
+                        open_trades=open_trades,
+                        asset_modes={a: "live_eligible" for a in self.data_by_asset},
                     )
-                else:  # "lowest_risk" (default)
-                    eval_result.candidates.sort(
-                        key=lambda c: (
-                            float(c.risk_report.score),
-                            -float(c.pattern_match.similarity),
+                    decision = self.decision_service.decide(
+                        candidates=step_candidates,
+                        state=state,
+                        config=cfg,
+                        client=self.llm_client,
+                        now=cur_t,
+                    )
+                    if decision.is_valid and decision.decision in ("CALL", "PUT"):
+                        cand = next(
+                            (
+                                c for c in step_candidates
+                                if c.asset == decision.asset and c.direction.value == decision.direction
+                            ),
+                            None,
                         )
+                        if cand and decision.stake_amount:
+                            stake = decision.stake_amount
+                            entry_delay = timedelta(minutes=cfg.backtest.entry_delay_bars)
+                            entry_time = cur_t + entry_delay
+                            lookup = fast_lookup_by_asset.get(cand.asset)
+                            entry_bar = lookup.get_bar(entry_time) if lookup else None
+                            if entry_bar is not None and stake <= cash:
+                                open_px = entry_bar["open"]
+                                slippage = cfg.backtest.slippage_atr * cand.atr
+                                entry_price = open_px + slippage if cand.direction == TradeDirection.CALL else open_px - slippage
+                                exit_time = entry_time + timedelta(minutes=expiry_minutes)
+
+                                cash -= stake
+                                trade_counter += 1
+                                trade_id = f"bt_{variant_name}_{trade_counter}"
+                                payout = getattr(cfg.backtest, "default_payout", 0.85)
+
+                                record = TradeRecord(
+                                    id=trade_id,
+                                    opened_at=entry_time.isoformat(),
+                                    asset=cand.asset,
+                                    is_otc=False,
+                                    direction=cand.direction.value,
+                                    expiry_minutes=expiry_minutes,
+                                    stake=stake,
+                                    payout_at_entry=payout,
+                                    result="PENDING",
+                                    pnl=0.0,
+                                    mode="backtest",
+                                    pattern_name=cand.pattern_match.pattern_name,
+                                    pattern_type=cand.pattern_match.pattern_type,
+                                    risk_score=cand.risk_report.score,
+                                    hour_utc=entry_time.hour,
+                                )
+                                self.repo.insert(record)
+                                open_trades.append(
+                                    OpenTrade(
+                                        trade_id=trade_id,
+                                        asset=cand.asset,
+                                        direction=cand.direction,
+                                        stake=stake,
+                                        entry_time=entry_time,
+                                        entry_price=entry_price,
+                                        expiry_minutes=expiry_minutes,
+                                        exit_time=exit_time,
+                                        payout=payout,
+                                        pattern_name=cand.pattern_match.pattern_name,
+                                        pattern_type=cand.pattern_match.pattern_type,
+                                        risk_score=cand.risk_report.score,
+                                        evidence=cand.evidence,
+                                    )
+                                )
+                    else:
+                        skip_counts["llm_skip"] = skip_counts.get("llm_skip", 0) + 1
+            else:
+                for asset, cands in candidates_by_asset.items():
+                    # Decision policy: choose 1 candidate for this asset
+                    if cfg.backtest.decision_policy == "highest_similarity":
+                        cands.sort(
+                            key=lambda c: (
+                                -float(c.pattern_match.similarity),
+                                float(c.risk_report.score),
+                            )
+                        )
+                    else:  # "lowest_risk" (default)
+                        cands.sort(
+                            key=lambda c: (
+                                float(c.risk_report.score),
+                                -float(c.pattern_match.similarity),
+                            )
+                        )
+
+                    cand = cands[0]
+
+                    # Check portfolio constraints
+                    # a) Opposite-direction block
+                    has_opposite = any(
+                        ot.asset == asset and ot.direction != cand.direction
+                        for ot in open_trades
+                    )
+                    if has_opposite:
+                        skip_counts["opposite_direction"] += 1
+                        continue
+
+                    # b) Stake sizing (recompute open stakes and equity per committed trade)
+                    current_open_stakes = sum(ot.stake for ot in open_trades)
+                    equity = compute_equity(cash, current_open_stakes)
+
+                    target_pct = cand.max_stake_pct
+                    if cfg.backtest.stake_policy == "mid":
+                        target_pct = (cfg.stake.min_pct + target_pct) / 2.0
+                    elif cfg.backtest.stake_policy == "min":
+                        target_pct = cfg.stake.min_pct
+
+                    stake = stake_amount(
+                        equity=equity,
+                        pct=target_pct,
+                        min_amount=cfg.stake.min_amount,
+                        round_to=cfg.stake.round_to,
                     )
 
-                cand = eval_result.candidates[0]
+                    if stake is None:
+                        skip_counts["stake_below_min"] += 1
+                        continue
 
-                # Check portfolio constraints
-                # a) Opposite-direction block
-                has_opposite = any(
-                    ot.asset == asset and ot.direction != cand.direction
-                    for ot in open_trades
-                )
-                if has_opposite:
-                    skip_counts["opposite_direction"] += 1
-                    continue
+                    # c) Exposure cap (cfg.stake.total_cap_pct converted from percentage)
+                    total_cap_fraction = cfg.stake.total_cap_pct / 100.0
+                    if (current_open_stakes + stake) > (total_cap_fraction * equity):
+                        skip_counts["exposure_cap"] += 1
+                        continue
 
-                # b) Stake sizing
-                target_pct = cand.max_stake_pct
-                if cfg.backtest.stake_policy == "mid":
-                    target_pct = (cfg.stake.min_pct + target_pct) / 2.0
-                elif cfg.backtest.stake_policy == "min":
-                    target_pct = cfg.stake.min_pct
+                    # d) Cash sufficiency
+                    if stake > cash:
+                        skip_counts["insufficient_cash"] += 1
+                        continue
 
-                stake = stake_amount(
-                    equity=equity,
-                    pct=target_pct,
-                    min_amount=cfg.stake.min_amount,
-                    round_to=cfg.stake.round_to,
-                )
+                    # Entry execution: price at OPEN of next 1m bar + slippage
+                    entry_delay = timedelta(minutes=cfg.backtest.entry_delay_bars)
+                    entry_time = cur_t + entry_delay
+                    lookup = fast_lookup_by_asset.get(cand.asset)
+                    entry_bar = lookup.get_bar(entry_time) if lookup else None
+                    if entry_bar is None:
+                        skip_counts["data_gap_entry"] += 1
+                        continue
 
-                if stake is None:
-                    skip_counts["stake_below_min"] += 1
-                    continue
+                    open_px = entry_bar["open"]
+                    slippage = cfg.backtest.slippage_atr * cand.atr
+                    if cand.direction == TradeDirection.CALL:
+                        entry_price = open_px + slippage
+                    else:
+                        entry_price = open_px - slippage
 
-                # c) 35% exposure cap
-                if current_open_stakes + stake > 0.35 * equity:
-                    skip_counts["exposure_cap"] += 1
-                    continue
+                    exit_time = entry_time + timedelta(minutes=expiry_minutes)
 
-                # d) Cash sufficiency
-                if stake > cash:
-                    skip_counts["insufficient_cash"] += 1
-                    continue
+                    # Commit trade immediately so open_trades and equity reflect it on next asset
+                    cash -= stake
+                    trade_counter += 1
+                    trade_id = f"bt_{variant_name}_{trade_counter}"
 
-                # Entry execution: price at OPEN of next 1m bar + slippage
-                entry_delay = timedelta(minutes=cfg.backtest.entry_delay_bars)
-                entry_time = cur_t + entry_delay
-                bars_map = bars_1m_by_asset.get(asset, {})
-                entry_bar = bars_map.get(entry_time)
-                if entry_bar is None:
-                    continue
-
-                open_px = entry_bar["open"]
-                slippage = cfg.backtest.slippage_atr * cand.atr
-                if cand.direction == TradeDirection.CALL:
-                    entry_price = open_px + slippage
-                else:
-                    entry_price = open_px - slippage
-
-                exit_time = entry_time + timedelta(minutes=expiry_minutes)
-
-                # Commit trade
-                cash -= stake
-                trade_counter += 1
-                trade_id = f"bt_{variant_name}_{trade_counter}"
-
-                # Insert into TradeRepository
-                record = TradeRecord(
-                    id=trade_id,
-                    opened_at=entry_time.isoformat(),
-                    asset=asset,
-                    is_otc=False,
-                    direction=cand.direction.value,
-                    expiry_minutes=expiry_minutes,
-                    stake=stake,
-                    payout_at_entry=payout,
-                    result="PENDING",
-                    pnl=0.0,
-                    mode="backtest",
-                    pattern_name=cand.pattern_match.pattern_name,
-                    pattern_type=cand.pattern_match.pattern_type,
-                    risk_score=cand.risk_report.score,
-                    hour_utc=entry_time.hour,
-                )
-                self.repo.insert(record)
-
-                open_trades.append(
-                    OpenTrade(
-                        trade_id=trade_id,
-                        asset=asset,
-                        direction=cand.direction,
-                        stake=stake,
-                        entry_time=entry_time,
-                        entry_price=entry_price,
+                    payout = getattr(cfg.backtest, "default_payout", 0.85)
+                    record = TradeRecord(
+                        id=trade_id,
+                        opened_at=entry_time.isoformat(),
+                        asset=cand.asset,
+                        is_otc=False,
+                        direction=cand.direction.value,
                         expiry_minutes=expiry_minutes,
-                        exit_time=exit_time,
-                        payout=payout,
+                        stake=stake,
+                        payout_at_entry=payout,
+                        result="PENDING",
+                        pnl=0.0,
+                        mode="backtest",
                         pattern_name=cand.pattern_match.pattern_name,
                         pattern_type=cand.pattern_match.pattern_type,
                         risk_score=cand.risk_report.score,
-                        evidence=cand.evidence,
+                        hour_utc=entry_time.hour,
                     )
-                )
+                    self.repo.insert(record)
+
+                    open_trades.append(
+                        OpenTrade(
+                            trade_id=trade_id,
+                            asset=cand.asset,
+                            direction=cand.direction,
+                            stake=stake,
+                            entry_time=entry_time,
+                            entry_price=entry_price,
+                            expiry_minutes=expiry_minutes,
+                            exit_time=exit_time,
+                            payout=payout,
+                            pattern_name=cand.pattern_match.pattern_name,
+                            pattern_type=cand.pattern_match.pattern_type,
+                            risk_score=cand.risk_report.score,
+                            evidence=cand.evidence,
+                        )
+                    )
 
             cur_t += check_interval
 
-        # Settle any trades still open at simulation end
+        # Settle any trades still open at simulation end using shared settle_position
         for ot in open_trades:
-            bars_map = bars_1m_by_asset.get(ot.asset, {})
-            exit_bar = bars_map.get(ot.exit_time)
-            exit_price = exit_bar["close"] if exit_bar else ot.entry_price
+            lookup = fast_lookup_by_asset.get(ot.asset)
+            exit_bar = lookup.get_bar(ot.exit_time) if lookup else None
+            res, pnl, cash_refund = settle_position(ot, exit_bar, cfg.backtest.tie_policy)
+            if res == "VOID":
+                skip_counts["data_gap_exit"] += 1
+            cash += cash_refund
 
-            if ot.direction == TradeDirection.CALL:
-                res = "WIN" if exit_price > ot.entry_price else "LOSS"
-            else:
-                res = "WIN" if exit_price < ot.entry_price else "LOSS"
-
-            pnl = ot.stake * ot.payout if res == "WIN" else -ot.stake
-            cash += ot.stake + pnl
             self.repo.update_result(
                 trade_id=ot.trade_id,
                 closed_at=ot.exit_time.isoformat(),

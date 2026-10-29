@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional, Union
 
@@ -50,11 +50,19 @@ class DataStore:
     """SQLite-backed data store for candles, quotes/payouts, and trade records."""
 
     def __init__(self, db_path: Union[str, Path] = DEFAULT_DB_PATH):
-        self.db_path = Path(db_path)
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        if str(db_path) == ":memory:":
+            self.db_path = ":memory:"
+            self._mem_conn = sqlite3.connect(":memory:")
+            self._mem_conn.row_factory = sqlite3.Row
+        else:
+            self.db_path = Path(db_path)
+            self.db_path.parent.mkdir(parents=True, exist_ok=True)
+            self._mem_conn = None
         self._init_db()
 
     def _get_connection(self) -> sqlite3.Connection:
+        if self._mem_conn is not None:
+            return self._mem_conn
         conn = sqlite3.connect(str(self.db_path))
         conn.row_factory = sqlite3.Row
         return conn
@@ -70,6 +78,7 @@ class DataStore:
                     asset_id TEXT NOT NULL,
                     timeframe TEXT NOT NULL,
                     ts TEXT NOT NULL,
+                    ts_close TEXT,
                     open REAL NOT NULL,
                     high REAL NOT NULL,
                     low REAL NOT NULL,
@@ -171,6 +180,12 @@ class DataStore:
             candles_df["ts"] = candles_df["ts"].dt.tz_convert(timezone.utc)
 
         ts_strings = candles_df["ts"].dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+        if "ts_close" in candles_df.columns:
+            if not pd.api.types.is_datetime64_any_dtype(candles_df["ts_close"]):
+                candles_df["ts_close"] = pd.to_datetime(candles_df["ts_close"], utc=True)
+            ts_close_strings = candles_df["ts_close"].dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+        else:
+            ts_close_strings = [None] * len(candles_df)
 
         if "volume" not in candles_df.columns:
             volume_series = 0.0
@@ -182,14 +197,16 @@ class DataStore:
                 asset_id,
                 timeframe,
                 ts_str,
+                ts_close_str,
                 float(row["open"]),
                 float(row["high"]),
                 float(row["low"]),
                 float(row["close"]),
                 float(vol),
             )
-            for ts_str, (_, row), vol in zip(
+            for ts_str, ts_close_str, (_, row), vol in zip(
                 ts_strings,
+                ts_close_strings,
                 candles_df.iterrows(),
                 volume_series if isinstance(volume_series, pd.Series) else [0.0] * len(candles_df),
             )
@@ -199,8 +216,8 @@ class DataStore:
             cursor = conn.cursor()
             cursor.executemany(
                 """
-                INSERT OR REPLACE INTO candles (asset_id, timeframe, ts, open, high, low, close, volume)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT OR REPLACE INTO candles (asset_id, timeframe, ts, ts_close, open, high, low, close, volume)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 rows,
             )
@@ -215,7 +232,7 @@ class DataStore:
         since: Optional[datetime] = None,
     ) -> pd.DataFrame:
         """Fetch candles for an asset and timeframe, sorted ascending by ts."""
-        query = "SELECT ts, open, high, low, close, volume FROM candles WHERE asset_id = ? AND timeframe = ?"
+        query = "SELECT ts, ts_close, open, high, low, close, volume FROM candles WHERE asset_id = ? AND timeframe = ?"
         params: list[Union[str, int]] = [asset_id, timeframe]
 
         if since is not None:
@@ -232,9 +249,16 @@ class DataStore:
             df = pd.read_sql_query(query, conn, params=params)
 
         if df.empty:
-            return pd.DataFrame(columns=["ts", "open", "high", "low", "close", "volume"])
+            return pd.DataFrame(columns=["ts", "ts_close", "open", "high", "low", "close", "volume"])
 
         df["ts"] = pd.to_datetime(df["ts"], utc=True)
+        if "ts_close" in df.columns and not df["ts_close"].isna().all():
+            df["ts_close"] = pd.to_datetime(df["ts_close"], utc=True)
+        else:
+            # Fallback for legacy rows
+            from data.candle_builder import TIMEFRAME_DELTAS
+            delta = TIMEFRAME_DELTAS.get(timeframe, timedelta(minutes=1))
+            df["ts_close"] = df["ts"] + delta
         if n is not None and n > 0:
             df = df.tail(n).reset_index(drop=True)
 

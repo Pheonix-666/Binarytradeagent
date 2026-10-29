@@ -10,3 +10,5 @@ dist/
 build/
 .venv/
 venv/
+data_history/
+docs/backtests/

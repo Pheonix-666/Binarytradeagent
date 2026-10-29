@@ -125,6 +125,40 @@ def get_daily_bucket_start(
     return start_local.astimezone(timezone.utc)
 
 
+def get_daily_bucket_end(
+    bucket_start: datetime,
+    calendar: CalendarConfig,
+) -> datetime:
+    """Calculate the UTC timestamp for the end of the daily candle starting at bucket_start.
+
+    Aligned to daily_boundary_tz and daily_boundary_hour (e.g. 17:00 America/New_York next day).
+    """
+    if bucket_start.tzinfo is None:
+        b_utc = bucket_start.replace(tzinfo=timezone.utc)
+    else:
+        b_utc = bucket_start.astimezone(timezone.utc)
+
+    tz_name = calendar.daily_boundary_tz or "UTC"
+    try:
+        tz = zoneinfo.ZoneInfo(tz_name)
+    except Exception:
+        tz = timezone.utc
+
+    b_local = b_utc.astimezone(tz)
+    b_hour = calendar.daily_boundary_hour
+    end_date = b_local.date() + timedelta(days=1)
+    end_local = datetime(
+        end_date.year,
+        end_date.month,
+        end_date.day,
+        b_hour,
+        0,
+        0,
+        tzinfo=tz,
+    )
+    return end_local.astimezone(timezone.utc)
+
+
 def expected_bars(
     bucket_start: datetime,
     timeframe: str,
