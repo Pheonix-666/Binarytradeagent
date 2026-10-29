@@ -59,29 +59,35 @@ def default_risk_config() -> RiskConfig:
 
 
 def test_max_stake_pct_known_values():
-    """risk 1 -> 20%, risk 100 -> 2%, risk 50 -> ~11.09%."""
-    assert max_stake_pct(1.0, min_pct=2.0, max_pct=20.0) == 20.0
-    assert max_stake_pct(100.0, min_pct=2.0, max_pct=20.0) == 2.0
+    """risk 1 -> 20%, risk 100 -> 1%, risk 50 -> 10.60%."""
+    assert max_stake_pct(1.0, min_pct=1.0, max_pct=20.0) == 20.0
+    assert max_stake_pct(100.0, min_pct=1.0, max_pct=20.0) == 1.0
 
-    # risk 50: 20 - (49/99)*18 = 20 - 8.9090909... = 11.090909...
-    mid = max_stake_pct(50.0, min_pct=2.0, max_pct=20.0)
-    assert abs(mid - 11.0909) < 0.001
+    # risk 50: 20 - (49/99)*19 = 20 - 9.4040404... = 10.595959... -> 10.60%
+    mid = max_stake_pct(50.0, min_pct=1.0, max_pct=20.0)
+    assert abs(mid - 10.595959) < 0.001
+    assert round(mid, 2) == 10.60
+
+    # Verify default parameter values
+    assert max_stake_pct(1.0) == 20.0
+    assert max_stake_pct(100.0) == 1.0
+    assert round(max_stake_pct(50.0), 2) == 10.60
 
 
 def test_max_stake_pct_property_monotonic_decrease():
     """Property test: stake percentage never increases as risk score increases from 1 to 100."""
-    previous = max_stake_pct(1.0, min_pct=2.0, max_pct=20.0)
+    previous = max_stake_pct(1.0, min_pct=1.0, max_pct=20.0)
     for r in range(2, 101):
-        current = max_stake_pct(float(r), min_pct=2.0, max_pct=20.0)
+        current = max_stake_pct(float(r), min_pct=1.0, max_pct=20.0)
         assert current <= previous, f"Stake increased at risk {r}: {current} > {previous}"
         previous = current
 
 
 def test_max_stake_pct_clamped_at_extremes():
     """Out-of-range risk inputs must be clamped safely to [min_pct, max_pct]."""
-    assert max_stake_pct(0.0, min_pct=2.0, max_pct=20.0) == 20.0
-    assert max_stake_pct(-10.0, min_pct=2.0, max_pct=20.0) == 20.0
-    assert max_stake_pct(150.0, min_pct=2.0, max_pct=20.0) == 2.0
+    assert max_stake_pct(0.0, min_pct=1.0, max_pct=20.0) == 20.0
+    assert max_stake_pct(-10.0, min_pct=1.0, max_pct=20.0) == 20.0
+    assert max_stake_pct(150.0, min_pct=1.0, max_pct=20.0) == 1.0
 
 
 def test_stake_amount_rounding_and_skip():

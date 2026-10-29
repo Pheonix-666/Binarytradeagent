@@ -41,7 +41,7 @@ trading:
   min_trades_for_stats: 30
 
 stake:
-  min_pct: 2
+  min_pct: 1
   max_pct: 20
   total_cap_pct: 35
   daily_loss_limit_pct: null
@@ -144,6 +144,9 @@ llm:
   max_tokens: 800
   timeout_seconds: 20
   max_decision_age_seconds: 30
+  max_price_move_atr: 0.25
+  evidence_float_tolerance: 0.01
+  max_calls_per_hour: 60
 
 alerts:
   telegram_enabled: true
@@ -154,9 +157,10 @@ backtest:
   target_win_rate: 0.80
   assets: ["EURUSD", "GBPUSD", "USDJPY", "AUDUSD"]
   starting_balance: 10000.0
-  decision_policy: "lowest_risk"  # lowest_risk | highest_similarity
+  decision_policy: "lowest_risk"  # lowest_risk | highest_similarity | llm
   stake_policy: "max"             # max | mid | min
   entry_delay_bars: 1
   slippage_atr: 0.02
   tie_policy: "loss"              # refund | loss
   ignore_paper_gate: true
+  max_llm_steps: 200

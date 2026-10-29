@@ -41,7 +41,7 @@ Version 1.0. Read this entire file before writing any code.
 | Entry check | Every 5 minutes, right after the 5m candle closes |
 | Trend rule | **Strict gate**: trade direction must match daily and 1h trend, else SKIP |
 | Reversal patterns | Two modes built, backtest decides: `off` or `sr_bypass` (see 6.3) |
-| Stake range | 2% to 20% of balance per trade, 35% total open exposure |
+| Stake range | 1% to 20% of balance per trade, 35% total open exposure |
 | Stake from risk | Higher risk means a lower maximum stake (formula in 6.5) |
 | Multiple trades | Several trades on the same asset allowed, within the 35% cap. Never CALL and PUT on the same asset at the same time |
 | Daily loss limit | Setting exists, **default off** (`null`) |
@@ -119,7 +119,7 @@ trading:
   min_trades_for_stats: 30
 
 stake:
-  min_pct: 2
+  min_pct: 1
   max_pct: 20
   total_cap_pct: 35
   daily_loss_limit_pct: null   # null = off
@@ -253,10 +253,10 @@ Each input becomes a 0-100 **risk sub-score** (higher = riskier). The final risk
 **Stake from risk:**
 
 ```
-max_stake_pct = 20 - (risk - 1) / 99 * 18      # risk 1 -> 20%, risk 50 -> ~11%, risk 100 -> 2%
+max_stake_pct = 20 - (risk - 1) / 99 * 19      # risk 1 -> 20%, risk 50 -> 10.60%, risk 100 -> 1%
 ```
 
-(use `stake.max_pct` and `stake.min_pct` from config in place of 20 and 2). The LLM may choose any stake between `min_pct` and `max_pct_for_this_risk`, never above. Total open stakes may never exceed `total_cap_pct` of the balance.
+(use `stake.max_pct` and `stake.min_pct` from config in place of 20 and 1). The LLM may choose any stake between `min_pct` and `max_pct_for_this_risk`, never above. Total open stakes may never exceed `total_cap_pct` of the balance.
 
 ### 6.6 Pattern library (`patterns/`)
 
@@ -312,7 +312,7 @@ Rules:
   "balance": 1000.0,
   "open_exposure_pct": 12.0,
   "remaining_exposure_pct": 23.0,
-  "min_stake_pct": 2,
+  "min_stake_pct": 1,
   "candidates": [
     {
       "asset": "EURUSD",
@@ -324,7 +324,7 @@ Rules:
       "nearest_level": {"type": "support", "distance_atr": 1.8},
       "pattern": {"name": "double_bottom", "type": "reversal", "similarity": 82},
       "risk_score": 38,
-      "max_stake_pct": 13.4,
+      "max_stake_pct": 12.9,
       "asset_stats": {"trades": 240, "win_rate": 0.57, "mode": "live_eligible"}
     }
   ]
@@ -360,7 +360,7 @@ Rules:
 6. The decision is not older than `max_decision_age_seconds`, and current price has not moved against the signal beyond a configured tolerance.
 7. No opposite-direction open trade exists on the same asset.
 
-### 7.4 LLM client (`decision/llm_client.py`)
+### 7.5 LLM client (`decision/llm_client.py`)
 
 One abstract class with `AnthropicClient` and `GeminiClient`, chosen by `llm.provider`. Temperature 0. Timeout and retry once, then SKIP.
 

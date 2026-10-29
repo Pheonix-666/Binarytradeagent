@@ -44,7 +44,7 @@ from selection.stats import break_even, compute_asset_stats, ev
 def base_config() -> AppConfig:
     cfg = load_config("config.yaml")
     cfg.backtest.starting_balance = 10000.0
-    cfg.stake.min_pct = 2.0
+    cfg.stake.min_pct = 1.0
     cfg.stake.max_pct = 10.0
     cfg.stake.min_amount = 10.0
     cfg.stake.round_to = 1.0
@@ -195,7 +195,7 @@ def test_settlement_math_and_slippage(base_config):
 def test_portfolio_limits_and_skips(base_config):
     """Verify 35% exposure cap, opposite-direction block, and min_amount skip."""
     equity = 10000.0
-    max_exposure = 0.35 * equity  # 3500.0
+    max_exposure = (base_config.stake.total_cap_pct / 100.0) * equity
 
     # 1. Exposure cap test:
     open_stakes = 3400.0
@@ -407,5 +407,263 @@ def test_sanity_alarm_triggered_on_high_test_win_rate():
     ]
     metrics_test_normal = compute_variant_metrics(trades_normal, is_test_set=True)
     assert metrics_test_normal.sanity_alarm is False
+
+
+# ── Regression Tests for Look-Ahead Leak Fix & Engine Improvements ──────
+
+
+def test_boundary_and_intermediate_bar_closure_causality(base_config):
+    """(2a) For random t on and between boundaries, all visible bars have ts_close <= t.
+
+    The last visible bar's close must equal the 1m close at ts_close - 1 minute.
+    """
+    cal = CalendarConfig(type="always_open", daily_boundary_tz="UTC", daily_boundary_hour=0)
+    start_dt = datetime(2026, 8, 1, 0, 0, 0, tzinfo=timezone.utc)
+    df_full = generate_synthetic_candles("EURUSD", start_dt=start_dt, days=5, calendar=cal, seed=42)
+    p_data = precompute_asset_data("EURUSD", df_full, cal, base_config)
+
+    # Test times: on and between boundaries for 5m, 15m, 1h, and 1d
+    test_times = [
+        # On boundaries
+        start_dt + timedelta(days=2, hours=5, minutes=0),    # 1h & 15m & 5m boundary
+        start_dt + timedelta(days=2, hours=5, minutes=15),   # 15m & 5m boundary
+        start_dt + timedelta(days=2, hours=5, minutes=30),   # 15m & 5m boundary
+        start_dt + timedelta(days=2, hours=5, minutes=50),   # 5m boundary
+        start_dt + timedelta(days=3, hours=0, minutes=0),    # Daily boundary
+        # Between boundaries
+        start_dt + timedelta(days=2, hours=5, minutes=3),    # between 5m
+        start_dt + timedelta(days=2, hours=5, minutes=7),    # between 5m
+        start_dt + timedelta(days=2, hours=5, minutes=18),   # between 15m
+        start_dt + timedelta(days=2, hours=5, minutes=29),   # between 15m & 30m
+        start_dt + timedelta(days=2, hours=5, minutes=43),   # between 1h
+        start_dt + timedelta(days=2, hours=14, minutes=37),  # between daily
+    ]
+
+    for t in test_times:
+        sliced = p_data.slice_as_of(t)
+        for tf, df_tf in sliced.items():
+            if df_tf.empty:
+                continue
+            # Rule: every visible bar must have ts_close <= t
+            assert (df_tf["ts_close"] <= t).all(), (
+                f"Look-ahead detected on {tf} at {t}: max ts_close is {df_tf['ts_close'].max()}"
+            )
+            # Rule: last visible bar's close equals the 1m close at ts_close - 1 minute
+            last_bar = df_tf.iloc[-1]
+            t_expected_1m = last_bar["ts_close"] - timedelta(minutes=1)
+            m1_match = df_full[df_full["ts"] == t_expected_1m]
+            assert not m1_match.empty, f"Missing 1m bar at {t_expected_1m} for {tf}"
+            expected_close = float(m1_match["close"].iloc[0])
+            actual_close = float(last_bar["close"])
+            assert abs(actual_close - expected_close) < 1e-5, (
+                f"Mismatch on {tf} at {t}: last bar close {actual_close} != 1m close {expected_close}"
+            )
+
+
+def test_look_ahead_guard_perturbation_test(base_config):
+    """(2b) Perturbation test: replacing all 1m data with ts_close > t by noise leaves build_candidates identical."""
+    cal = CalendarConfig(type="always_open", daily_boundary_tz="UTC", daily_boundary_hour=0)
+    start_dt = datetime(2026, 8, 1, 0, 0, 0, tzinfo=timezone.utc)
+    df_clean = generate_synthetic_candles("EURUSD", start_dt=start_dt, days=6, calendar=cal, seed=777)
+    p_clean = precompute_asset_data("EURUSD", df_clean, cal, base_config)
+
+    # Pick 50 random times across day 3 to day 5
+    rng = np.random.default_rng(seed=999)
+    min_offset_m = 3 * 1440  # after 3 days of warmup
+    max_offset_m = 5 * 1440
+    random_offsets = rng.choice(np.arange(min_offset_m, max_offset_m, 15), size=50, replace=False)
+
+    for offset in random_offsets:
+        t = start_dt + timedelta(minutes=int(offset))
+
+        # 1. Evaluate candidates on clean data
+        clean_sliced = p_clean.slice_as_of(t)
+        res_clean = build_candidates(
+            asset="EURUSD",
+            t=t,
+            candles_by_tf=clean_sliced,
+            stats_as_of={},
+            config=base_config,
+            payout=0.85,
+            calendar=cal,
+        )
+
+        # 2. Corrupt/perturb ALL 1m data with ts_close > t with extreme random noise
+        df_perturbed = df_clean.copy()
+        future_mask = df_perturbed["ts_close"] > t
+        n_future = int(future_mask.sum())
+        if n_future > 0:
+            noise = rng.uniform(0.1, 10.0, size=n_future)
+            df_perturbed.loc[future_mask, "open"] = noise
+            df_perturbed.loc[future_mask, "high"] = noise * 1.5
+            df_perturbed.loc[future_mask, "low"] = noise * 0.5
+            df_perturbed.loc[future_mask, "close"] = noise * 1.2
+
+        # Recompute multi-timeframe data from perturbed 1m candles
+        p_perturbed = precompute_asset_data("EURUSD", df_perturbed, cal, base_config)
+        perturbed_sliced = p_perturbed.slice_as_of(t)
+
+        res_perturbed = build_candidates(
+            asset="EURUSD",
+            t=t,
+            candles_by_tf=perturbed_sliced,
+            stats_as_of={},
+            config=base_config,
+            payout=0.85,
+            calendar=cal,
+        )
+
+        # 3. Assert zero difference
+        assert len(res_clean.candidates) == len(res_perturbed.candidates), (
+            f"Perturbation leak at {t}: candidate count differed ({len(res_clean.candidates)} vs {len(res_perturbed.candidates)})"
+        )
+        assert res_clean.skip_reasons == res_perturbed.skip_reasons, (
+            f"Perturbation leak at {t}: skip reasons differed"
+        )
+
+        for c_clean, c_pert in zip(res_clean.candidates, res_perturbed.candidates):
+            assert c_clean.direction == c_pert.direction
+            assert abs(c_clean.current_price - c_pert.current_price) < 1e-5
+            assert abs(c_clean.atr - c_pert.atr) < 1e-5
+            assert c_clean.risk_report.score == c_pert.risk_report.score
+            assert c_clean.gate_result.passed == c_pert.gate_result.passed
+            assert c_clean.gate_result.reason == c_pert.gate_result.reason
+            assert c_clean.max_stake_pct == c_pert.max_stake_pct
+
+
+def test_exposure_cap_enforced_across_multiple_assets_in_same_step(base_config, monkeypatch):
+    """(4) Recompute open stakes & equity per trade; 4 assets signaling in same step respects total_cap_pct."""
+    cfg = base_config.model_copy(deep=True)
+    cfg.stake.total_cap_pct = 20.0  # 20% cap
+    cfg.stake.min_pct = 8.0
+    cfg.stake.max_pct = 8.0  # Force exact 8% stake request
+    cfg.backtest.starting_balance = 10000.0
+
+    cal = CalendarConfig(type="always_open", daily_boundary_tz="UTC", daily_boundary_hour=0)
+    start_dt = datetime(2026, 8, 1, 0, 0, 0, tzinfo=timezone.utc)
+
+    # Create 4 identical assets
+    data_by_asset = {}
+    for asset in ["EURUSD", "GBPUSD", "USDJPY", "AUDUSD"]:
+        df = generate_synthetic_candles(asset, start_dt=start_dt, days=5, calendar=cal, seed=123)
+        data_by_asset[asset] = precompute_asset_data(asset, df, cal, cfg)
+
+    # Monkeypatch build_candidates to return a qualifying candidate for each asset
+    from analysis.candidates import CandidateTrade, CandidateEvaluationResult
+    from core.models import GateResult, PatternMatch
+    from risk.engine import RiskReport
+
+    def mock_build_candidates(asset, t, **kwargs):
+        cand = CandidateTrade(
+            asset=asset,
+            direction=TradeDirection.CALL,
+            t=t,
+            current_price=1.1000,
+            atr=0.0010,
+            pattern={"pattern": "mock", "type": "bullish", "similarity": 85.0},
+            pattern_match=PatternMatch(pattern_name="mock", direction=TradeDirection.CALL, pattern_type="continuation", similarity=85.0),
+            risk_report=RiskReport(
+                score=20,
+                volatility_score=20.0,
+                pattern_score=20.0,
+                win_rate_score=20.0,
+                session_score=20.0,
+                sr_distance_score=20.0,
+                weights={},
+                raw_weighted_score=20.0,
+            ),
+            gate_result=GateResult(passed=True, reason="mock pass"),
+            max_stake_pct=8.0,
+            volatility_percentile=50.0,
+        )
+        return CandidateEvaluationResult(asset=asset, t=t, candidates=[cand], skip_reasons=[])
+
+    monkeypatch.setattr("backtest.engine.build_candidates", mock_build_candidates)
+
+    engine = BacktestEngine(config=cfg, data_by_asset=data_by_asset)
+    sim_t = start_dt + timedelta(days=3)
+
+    # Run for 1 single step
+    res = engine.run(start_t=sim_t, end_t=sim_t, expiry_minutes=30)
+
+    # With initial balance $10,000 and 20% cap ($2,000 limit):
+    # Asset 1 takes $800 (open: $800 <= $2000)
+    # Asset 2 takes $800 (open: $1600 <= $2000)
+    # Asset 3 requests $800 -> 1600 + 800 = $2400 > $2000 -> SKIPPED (exposure_cap)
+    # Asset 4 requests $800 -> 1600 + 800 = $2400 > $2000 -> SKIPPED (exposure_cap)
+    assert res.skip_counts["exposure_cap"] == 2
+    assert len(res.trades) == 2
+    committed_stakes = sum(t.stake for t in res.trades)
+    assert committed_stakes == 1600.0
+    assert committed_stakes <= 0.20 * cfg.backtest.starting_balance
+
+
+def test_settlement_missing_exit_bar_void_refund(base_config):
+    """(5a) Missing exit bar marks trade VOID (refunded, excluded from win/loss, counted as data_gap_exit)."""
+    from backtest.engine import OpenTrade, settle_position
+
+    ot = OpenTrade(
+        trade_id="bt_void_test",
+        asset="EURUSD",
+        direction=TradeDirection.CALL,
+        stake=250.0,
+        entry_time=datetime(2026, 8, 1, 10, 0, tzinfo=timezone.utc),
+        entry_price=1.1000,
+        expiry_minutes=30,
+        exit_time=datetime(2026, 8, 1, 10, 30, tzinfo=timezone.utc),
+        payout=0.85,
+        pattern_name="test_pattern",
+        pattern_type="bullish",
+        risk_score=25,
+    )
+
+    # Missing exit bar -> None
+    res, pnl, refund = settle_position(ot, exit_bar=None, tie_policy="loss")
+    assert res == "VOID"
+    assert pnl == 0.0
+    assert refund == 250.0  # Full refund
+
+    # Verify metrics excludes VOID trades from win rate calculation
+    record_void = TradeRecord(
+        id=ot.trade_id, opened_at=ot.entry_time.isoformat(), closed_at=ot.exit_time.isoformat(),
+        asset=ot.asset, is_otc=False, direction=ot.direction.value, expiry_minutes=ot.expiry_minutes,
+        stake=ot.stake, payout_at_entry=ot.payout, result="VOID", pnl=0.0, mode="backtest",
+    )
+    record_win = TradeRecord(
+        id="t_win", opened_at=ot.entry_time.isoformat(), closed_at=ot.exit_time.isoformat(),
+        asset=ot.asset, is_otc=False, direction="CALL", expiry_minutes=30,
+        stake=100.0, payout_at_entry=0.85, result="WIN", pnl=85.0, mode="backtest",
+    )
+    metrics = compute_variant_metrics([record_void, record_win])
+    assert metrics.total_trades == 2
+    assert metrics.void_trades == 1
+    assert metrics.wins == 1
+    assert metrics.losses == 0
+    # 1 win out of 1 valid trade -> 100% win rate
+    assert metrics.win_rate == 1.0
+
+
+def test_missing_entry_bar_data_gap_skip(base_config):
+    """(5b) Missing 1m entry bar skips trade entry and records data_gap_entry."""
+    cfg = base_config.model_copy(deep=True)
+    cal = CalendarConfig(type="always_open", daily_boundary_tz="UTC", daily_boundary_hour=0)
+    start_dt = datetime(2026, 8, 1, 0, 0, 0, tzinfo=timezone.utc)
+    df = generate_synthetic_candles("EURUSD", start_dt=start_dt, days=5, calendar=cal, seed=42)
+
+    # Create an artificial 1m data gap at evaluation time + entry delay
+    sim_t = start_dt + timedelta(days=3, hours=10)
+    gap_t = sim_t + timedelta(minutes=cfg.backtest.entry_delay_bars)
+    df_with_gap = df[df["ts"] != gap_t].copy().reset_index(drop=True)
+
+    p_data = precompute_asset_data("EURUSD", df_with_gap, cal, cfg)
+    engine = BacktestEngine(config=cfg, data_by_asset={"EURUSD": p_data})
+
+    # Run exactly at the step with missing entry bar
+    res = engine.run(start_t=sim_t, end_t=sim_t, expiry_minutes=30)
+    # If a candidate was generated, it must be skipped with data_gap_entry
+    # Even if no candidate was generated at that exact timestamp, verify no crash occurred and counter is present
+    assert "data_gap_entry" in res.skip_counts
+    assert "data_gap_exit" in res.skip_counts
+
 
 

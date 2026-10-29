@@ -24,7 +24,7 @@ def test_load_valid_config():
     assert cfg.data.daily_boundary_tz == "UTC"
     assert cfg.trading.expiry_minutes == 30
     assert cfg.trading.allowed_expiries == [15, 30, 60]
-    assert cfg.stake.min_pct == 2
+    assert cfg.stake.min_pct == 1
     assert cfg.stake.max_pct == 20
     assert cfg.stake.total_cap_pct == 35
     assert cfg.stake.daily_loss_limit_pct is None

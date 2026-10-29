@@ -19,7 +19,7 @@ import numpy as np
 
 def max_stake_pct(
     risk: float,
-    min_pct: float = 2.0,
+    min_pct: float = 1.0,
     max_pct: float = 20.0,
 ) -> float:
     """Calculate maximum allowed stake percentage for a given risk score (1-100).
@@ -66,14 +66,16 @@ def stake_amount(
     raw_cap = equity * (pct / 100.0)
 
     if round_to > 0:
-        # Floor to round_to increment (+1e-12 protects against micro floating point division artifacts)
+        # Determine decimal precision to avoid binary floating point representation artifacts
+        s = f"{round_to:.8f}".rstrip("0")
+        decimals = len(s.split(".")[1]) if "." in s else 2
+        decimals = max(decimals, 2)
+
+        # Floor to round_to increment
         steps = math.floor((raw_cap / round_to) + 1e-12)
-        floored = steps * round_to
-        if round_to >= 1.0:
-            floored = round(floored, 2)
-        else:
-            decimals = int(math.ceil(-math.log10(round_to)))
-            floored = round(floored, decimals)
+        floored = round(steps * round_to, decimals)
+        if floored > (raw_cap + 1e-12):
+            floored = round((steps - 1) * round_to, decimals)
     else:
         floored = round(raw_cap, 2)
 
