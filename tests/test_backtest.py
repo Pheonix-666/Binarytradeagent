@@ -373,3 +373,39 @@ def test_block_statistics_and_streaks_known_numbers():
     assert b50.hit_count == 0
     assert b50.actual_hit_rate == 0.0
 
+
+def test_sanity_alarm_triggered_on_high_test_win_rate():
+    """Sanity alarm fires if test set win rate >= 70% with >= 100 trades."""
+    # 1. 100 trades with 75% win rate on TEST set -> Must trigger sanity alarm
+    trades_high = [
+        TradeRecord(
+            id=f"t_{i}", opened_at="2026-10-29T10:00:00Z", closed_at="2026-10-29T10:30:00Z",
+            asset="EURUSD", is_otc=False, direction="CALL", expiry_minutes=30,
+            stake=10.0, payout_at_entry=0.85, result="WIN" if i < 75 else "LOSS",
+            pnl=8.5 if i < 75 else -10.0, mode="backtest",
+        )
+        for i in range(100)
+    ]
+    metrics_test_high = compute_variant_metrics(trades_high, is_test_set=True)
+    assert metrics_test_high.sanity_alarm is True
+    assert "SANITY ALARM" in metrics_test_high.sanity_alarm_message
+    assert "look-ahead bias" in metrics_test_high.sanity_alarm_message
+
+    # 2. Same trades on TRAIN set -> Should NOT trigger sanity alarm (train set can overfit)
+    metrics_train = compute_variant_metrics(trades_high, is_test_set=False)
+    assert metrics_train.sanity_alarm is False
+
+    # 3. 100 trades with 65% win rate on test set -> Should NOT trigger alarm (< 70%)
+    trades_normal = [
+        TradeRecord(
+            id=f"t_{i}", opened_at="2026-10-29T10:00:00Z", closed_at="2026-10-29T10:30:00Z",
+            asset="EURUSD", is_otc=False, direction="CALL", expiry_minutes=30,
+            stake=10.0, payout_at_entry=0.85, result="WIN" if i < 65 else "LOSS",
+            pnl=8.5 if i < 65 else -10.0, mode="backtest",
+        )
+        for i in range(100)
+    ]
+    metrics_test_normal = compute_variant_metrics(trades_normal, is_test_set=True)
+    assert metrics_test_normal.sanity_alarm is False
+
+
