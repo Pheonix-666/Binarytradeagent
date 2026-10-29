@@ -243,6 +243,7 @@ class BacktestEngine:
                     hour_risk_val=current_hour_risk,
                     payout=payout,
                     pattern_library=self.pattern_library,
+                    calendar=p_data.calendar,
                 )
 
                 # Record skip reasons

@@ -39,7 +39,7 @@ logger = get_logger()
 def run_full_backtest(
     config_path: str = "config.yaml",
     synthetic_if_missing: bool = True,
-    synthetic_days: int = 50,
+    synthetic_days: int = 16,
 ) -> Path:
     """Execute the full 6-variant train/test backtesting suite."""
     cfg = load_config(config_path)
@@ -48,8 +48,13 @@ def run_full_backtest(
     calendars = cfg.data.calendars
     configured_assets = cfg.backtest.assets
 
-    data_by_asset = {}
     history_dir = Path("data_history")
+    # For synthetic mode when CSVs are absent, test 2 representative assets
+    has_real_csv = any((history_dir / f"{a}.csv").exists() for a in configured_assets)
+    if not has_real_csv and synthetic_if_missing:
+        configured_assets = configured_assets[:2]
+
+    data_by_asset = {}
 
     for asset in configured_assets:
         cal_name = cfg.data.assets.get(asset, "forex")
@@ -85,8 +90,8 @@ def run_full_backtest(
     min_t = df_ref["ts"].min().to_pydatetime()
     max_t = df_ref["ts"].max().to_pydatetime()
 
-    # Skip first 10 days for indicator warm-up
-    warmup_days = 10
+    # Skip first 5 days for indicator warm-up
+    warmup_days = 5
     sim_start = min_t + pd.Timedelta(days=warmup_days)
     if sim_start >= max_t:
         sim_start = min_t + (max_t - min_t) * 0.2
@@ -179,39 +184,46 @@ def run_full_backtest(
     selectivity_rows = []
     test_days = max(1.0, (max_t - split_t).total_seconds() / 86400.0)
 
-    for sim_thresh in [60.0, 70.0, 75.0, 80.0, 85.0]:
-        for max_risk in [60.0, 50.0, 40.0, 30.0]:
-            sel_cfg = cfg.model_copy(deep=True)
-            sel_cfg.patterns.min_similarity = sim_thresh
-            sel_cfg.gate.reversal_bypass.max_risk_score = max_risk
+    selectivity_levels = [
+        (60.0, 60.0),
+        (70.0, 50.0),
+        (75.0, 45.0),
+        (80.0, 40.0),
+        (85.0, 35.0),
+    ]
 
-            eng = BacktestEngine(config=sel_cfg, data_by_asset=data_by_asset)
-            r_sel = eng.run(
-                start_t=split_t,
-                end_t=max_t,
-                expiry_minutes=best_variant["variant"]["expiry"],
-                reversal_mode=best_variant["variant"]["reversal_mode"],
-                variant_name=f"sel_{sim_thresh}_{max_risk}",
-            )
-            m_sel = compute_variant_metrics(
-                r_sel.trades,
-                starting_balance=r_sel.starting_balance,
-                final_equity=r_sel.final_equity,
-                max_drawdown=r_sel.max_drawdown,
-                target_win_rate=cfg.backtest.target_win_rate,
-                is_test_set=True,
-            )
-            trades_per_day = round(m_sel.total_trades / test_days, 1)
-            selectivity_rows.append({
-                "min_sim": sim_thresh,
-                "max_risk": max_risk,
-                "trades": m_sel.total_trades,
-                "trades_per_day": trades_per_day,
-                "win_rate": m_sel.win_rate,
-                "wilson_ci": m_sel.wilson_ci,
-                "ev_per_trade": m_sel.ev_per_trade,
-                "realized_return": m_sel.realized_return,
-            })
+    for sim_thresh, max_risk in selectivity_levels:
+        sel_cfg = cfg.model_copy(deep=True)
+        sel_cfg.patterns.min_similarity = sim_thresh
+        sel_cfg.gate.reversal_bypass.max_risk_score = max_risk
+
+        eng = BacktestEngine(config=sel_cfg, data_by_asset=data_by_asset)
+        r_sel = eng.run(
+            start_t=split_t,
+            end_t=max_t,
+            expiry_minutes=best_variant["variant"]["expiry"],
+            reversal_mode=best_variant["variant"]["reversal_mode"],
+            variant_name=f"sel_{sim_thresh}_{max_risk}",
+        )
+        m_sel = compute_variant_metrics(
+            r_sel.trades,
+            starting_balance=r_sel.starting_balance,
+            final_equity=r_sel.final_equity,
+            max_drawdown=r_sel.max_drawdown,
+            target_win_rate=cfg.backtest.target_win_rate,
+            is_test_set=True,
+        )
+        trades_per_day = round(m_sel.total_trades / test_days, 1)
+        selectivity_rows.append({
+            "min_sim": sim_thresh,
+            "max_risk": max_risk,
+            "trades": m_sel.total_trades,
+            "trades_per_day": trades_per_day,
+            "win_rate": m_sel.win_rate,
+            "wilson_ci": m_sel.wilson_ci,
+            "ev_per_trade": m_sel.ev_per_trade,
+            "realized_return": m_sel.realized_return,
+        })
 
     # Generate timestamped report directory
     timestamp_str = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")

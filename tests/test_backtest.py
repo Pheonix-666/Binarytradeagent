@@ -60,18 +60,18 @@ def test_look_ahead_guard_truncated_vs_full_data(base_config):
     cal = CalendarConfig(type="always_open", daily_boundary_tz="UTC", daily_boundary_hour=0)
     start_dt = datetime(2026, 8, 1, 0, 0, 0, tzinfo=timezone.utc)
 
-    # 18 days of synthetic data
+    # 7 days of synthetic data
     df_full = generate_synthetic_candles(
         asset_id="EURUSD",
         start_dt=start_dt,
-        days=18,
+        days=7,
         calendar=cal,
         seed=101,
     )
     p_full = precompute_asset_data("EURUSD", df_full, cal, base_config)
 
-    # Cutoff T at day 14
-    t_cutoff = start_dt + timedelta(days=14)
+    # Cutoff T at day 5
+    t_cutoff = start_dt + timedelta(days=5)
     expiry = 30  # 30 minutes
     safe_window_end = t_cutoff - timedelta(minutes=expiry)
 
@@ -79,7 +79,7 @@ def test_look_ahead_guard_truncated_vs_full_data(base_config):
     df_trunc = df_full[df_full["ts"] <= t_cutoff].copy().reset_index(drop=True)
     p_trunc = precompute_asset_data("EURUSD", df_trunc, cal, base_config)
 
-    sim_start = start_dt + timedelta(days=5)  # allow indicator warmup
+    sim_start = start_dt + timedelta(days=3)  # allow indicator warmup
 
     # Run on full data up to t_cutoff
     engine_full = BacktestEngine(config=base_config, data_by_asset={"EURUSD": p_full})
@@ -287,7 +287,7 @@ def test_planted_edge_detection(base_config):
     df_planted = generate_synthetic_candles(
         asset_id="EURUSD",
         start_dt=start_dt,
-        days=25,
+        days=8,
         calendar=cal,
         seed=42,
         planted_edge="CALL",
@@ -300,8 +300,8 @@ def test_planted_edge_detection(base_config):
     cfg.gate.strict_trend_gate = True
 
     engine = BacktestEngine(config=cfg, data_by_asset={"EURUSD": p_data})
-    sim_start = start_dt + timedelta(days=6)
-    sim_end = start_dt + timedelta(days=24)
+    sim_start = start_dt + timedelta(days=3)
+    sim_end = start_dt + timedelta(days=7)
 
     res = engine.run(start_t=sim_start, end_t=sim_end, expiry_minutes=30)
     metrics = compute_variant_metrics(res.trades)

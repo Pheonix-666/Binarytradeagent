@@ -52,7 +52,7 @@ def label_trend(
     if timeframe is not None:
         gaps = detect_gaps(recent_df, timeframe, calendar=calendar)
         if gaps:
-            logger.info(
+            logger.debug(
                 f"Trend INSUFFICIENT_DATA: {len(gaps)} gap(s) found in last {min_required_bars} bars for {timeframe}"
             )
             return TrendLabel.INSUFFICIENT_DATA
@@ -60,7 +60,7 @@ def label_trend(
         ts = pd.to_datetime(recent_df["ts"], utc=True).sort_values()
         diffs = ts.diff().dropna()
         if not diffs.empty and any(diffs > diffs.min()):
-            logger.info(
+            logger.debug(
                 f"Trend INSUFFICIENT_DATA: gap detected in last {min_required_bars} bars"
             )
             return TrendLabel.INSUFFICIENT_DATA
@@ -85,6 +85,7 @@ def label_trend(
 def analyze_trend(
     candles_by_tf: dict[str, pd.DataFrame],
     trend_cfg: TrendConfig,
+    calendar: Optional[CalendarConfig] = None,
 ) -> TrendReport:
     """Label trends for daily, 1h, and 15m timeframes using per-timeframe config."""
     daily_df = candles_by_tf.get("1d", candles_by_tf.get("daily", pd.DataFrame()))
@@ -99,6 +100,7 @@ def analyze_trend(
         adx_min=trend_cfg.daily.adx_min,
         warmup_multiplier=trend_cfg.daily.warmup_multiplier,
         timeframe="1d",
+        calendar=calendar,
     )
     hourly_label = label_trend(
         hourly_df,
@@ -108,6 +110,7 @@ def analyze_trend(
         adx_min=trend_cfg.h1.adx_min,
         warmup_multiplier=trend_cfg.h1.warmup_multiplier,
         timeframe="1h",
+        calendar=calendar,
     )
     fifteen_label = label_trend(
         fifteen_df,
@@ -117,6 +120,7 @@ def analyze_trend(
         adx_min=trend_cfg.m15.adx_min,
         warmup_multiplier=trend_cfg.m15.warmup_multiplier,
         timeframe="15m",
+        calendar=calendar,
     )
 
     return TrendReport(

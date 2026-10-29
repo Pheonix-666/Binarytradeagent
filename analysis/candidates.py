@@ -92,6 +92,7 @@ def build_candidates(
     hour_risk_val: Optional[float] = None,
     payout: Optional[float] = None,
     pattern_library: Optional[PatternLibrary] = None,
+    calendar: Optional[CalendarConfig] = None,
 ) -> CandidateEvaluationResult:
     """Generate trade candidates for an asset at time t.
 
@@ -106,6 +107,7 @@ def build_candidates(
       hour_risk_val: Pre-computed hour-of-day risk score as of t (optional).
       payout: Payout rate (e.g. 0.85); if None, uses default 0.85.
       pattern_library: PatternLibrary instance; if None, uses default singleton.
+      calendar: Market calendar configuration (optional).
     """
     if pattern_library is None:
         templates_dir = getattr(config.patterns, "templates_dir", "patterns/templates")
@@ -114,7 +116,49 @@ def build_candidates(
     effective_payout = payout if (payout is not None and payout > 0.0) else 0.85
 
     # 1. Multi-timeframe trend report
-    trend_report = analyze_trend(candles_by_tf, config.gate.trend)
+    trend_report = analyze_trend(candles_by_tf, config.gate.trend, calendar=calendar)
+
+    # Check for Insufficient Data in any trend timeframe
+    if (
+        trend_report.daily == TrendLabel.INSUFFICIENT_DATA
+        or trend_report.hourly == TrendLabel.INSUFFICIENT_DATA
+        or trend_report.fifteen_min == TrendLabel.INSUFFICIENT_DATA
+    ):
+        return CandidateEvaluationResult(
+            asset=asset,
+            t=t,
+            candidates=[],
+            skip_reasons=["insufficient data for trend indicators"],
+        )
+
+    # Direction eligibility pre-check: skip expensive DTW pattern matching if gate will reject
+    can_call_trend = (
+        trend_report.daily == TrendLabel.UP
+        and trend_report.hourly == TrendLabel.UP
+        and trend_report.fifteen_min != TrendLabel.DOWN
+    )
+    can_put_trend = (
+        trend_report.daily == TrendLabel.DOWN
+        and trend_report.hourly == TrendLabel.DOWN
+        and trend_report.fifteen_min != TrendLabel.UP
+    )
+    is_reversal = (config.gate.reversal_mode == "sr_bypass")
+
+    eligible_directions: list[TradeDirection] = []
+    if can_call_trend or is_reversal:
+        eligible_directions.append(TradeDirection.CALL)
+    if can_put_trend or is_reversal:
+        eligible_directions.append(TradeDirection.PUT)
+
+    if not eligible_directions:
+        return CandidateEvaluationResult(
+            asset=asset,
+            t=t,
+            candidates=[],
+            skip_reasons=[
+                f"gate: trend not aligned (daily={trend_report.daily.value}, 1h={trend_report.hourly.value}, 15m={trend_report.fifteen_min.value})"
+            ],
+        )
 
     # Determine reference price and ATR
     df_5m = candles_by_tf.get("5m", pd.DataFrame())
@@ -191,8 +235,8 @@ def build_candidates(
     ):
         skip_reasons.append("insufficient data for trend indicators")
 
-    # Evaluate each direction independently
-    for direction in [TradeDirection.CALL, TradeDirection.PUT]:
+    # Evaluate each eligible direction
+    for direction in eligible_directions:
         # Filter patterns matching direction and min_similarity
         dir_patterns = [
             p for p in all_patterns
