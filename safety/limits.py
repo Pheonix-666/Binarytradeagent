@@ -26,6 +26,7 @@ from typing import Any, Optional, Sequence
 
 from adaptive.monitor import AdaptiveState
 from core.config import AppConfig
+from core.models import to_canonical_trade
 
 logger = logging.getLogger(__name__)
 
@@ -113,6 +114,8 @@ def check_order(
     """
     asset = getattr(order, "asset", "")
     direction = str(getattr(order, "direction", "")).upper()
+    if direction not in ("CALL", "PUT"):
+        return Block(f"Invalid direction '{direction}'; must be 'CALL' or 'PUT'")
     expiry_minutes = int(getattr(order, "expiry_minutes", 0))
     stake = float(getattr(order, "stake", getattr(order, "stake_amount", 0.0)))
     cand_max_pct = getattr(order, "max_stake_pct", None)
@@ -162,18 +165,28 @@ def check_order(
             f"Expiry {expiry_minutes}m not in allowed_expiries {config.trading.allowed_expiries}"
         )
 
-    # 5. No Opposite Trades on Same Asset / Unknown Direction Fail Closed
+    # 5. Open Trades Validation: Opposite Trades & Missing/Invalid Stake Fail Closed
+    current_open_stakes = 0.0
     for ot in open_trades:
-        ot_asset = getattr(ot, "asset", "")
-        if isinstance(ot, dict):
-            ot_asset = ot.get("asset", "")
-        if ot_asset == asset:
-            raw_dir = ot.get("direction") if isinstance(ot, dict) else getattr(ot, "direction", None)
-            ot_dir = str(raw_dir).upper() if raw_dir is not None else ""
-            if ot_dir in ("CALL", "PUT"):
-                if ot_dir != direction:
+        c_ot = to_canonical_trade(ot)
+        # Missing or unparseable stake check
+        if math.isnan(c_ot.stake) or c_ot.stake < 0:
+            if not shadow_only:
+                return Block(
+                    f"open trade with missing or invalid stake on {c_ot.asset or 'unknown'}",
+                    alert_required=True,
+                    alert_text=f"🚨 Open trade with missing or invalid stake on {c_ot.asset or 'unknown'}",
+                )
+            stk_to_add = 0.0
+        else:
+            stk_to_add = c_ot.stake
+        current_open_stakes += stk_to_add
+
+        if c_ot.asset == asset:
+            if c_ot.direction in ("CALL", "PUT"):
+                if c_ot.direction != direction:
                     return Block(
-                        f"Opposite direction trade already open on {asset} ({ot_dir} vs {direction})"
+                        f"Opposite direction trade already open on {asset} ({c_ot.direction} vs {direction})"
                     )
             else:
                 # Open trade on same asset has missing or unparseable direction -> fail closed for real orders
@@ -226,22 +239,21 @@ def check_order(
     if max_amount is not None:
         max_allowed_stake = min(max_allowed_stake, max_amount)
 
-    allowed_ceiling = max(max_allowed_stake, min_stake_amt)
-    if stake > allowed_ceiling + 1e-6:
+    # If the tier-scaled maximum is below the minimum stake, BLOCK (do not raise ceiling)
+    if max_allowed_stake < min_stake_amt:
         return Block(
-            f"Stake {stake} exceeds tier-scaled maximum allowed {allowed_ceiling} "
+            f"Tier-scaled maximum allowed {max_allowed_stake} ({tier_scaled_max_pct:.2f}% of equity {equity}) "
+            f"is below minimum stake {min_stake_amt}"
+        )
+
+    if stake > max_allowed_stake + 1e-6:
+        return Block(
+            f"Stake {stake} exceeds tier-scaled maximum allowed {max_allowed_stake} "
             f"({tier_scaled_max_pct:.2f}% of equity {equity})"
         )
 
     # 9. Total Open Exposure Cap
     total_cap_pct = config.stake.total_cap_pct
-    current_open_stakes = 0.0
-    for ot in open_trades:
-        stk = getattr(ot, "stake", getattr(ot, "stake_amount", 0.0))
-        if isinstance(ot, dict):
-            stk = ot.get("stake", ot.get("stake_amount", 0.0))
-        current_open_stakes += float(stk)
-
     new_total_stakes = current_open_stakes + stake
     exposure_pct = (new_total_stakes / equity) * 100.0
     if exposure_pct > total_cap_pct + 1e-6:

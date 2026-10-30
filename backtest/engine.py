@@ -261,7 +261,7 @@ class BacktestEngine:
                 if ot.exit_time <= cur_t:
                     lookup = fast_lookup_by_asset.get(ot.asset)
                     exit_bar = lookup.get_bar(ot.exit_time) if lookup else None
-                    result, pnl, cash_refund = settle_position(ot, exit_bar, cfg.backtest.tie_policy)
+                    result, pnl, cash_refund = settle_position(ot, exit_bar, cfg.trading.tie_policy)
                     if result == "VOID":
                         skip_counts["data_gap_exit"] += 1
                     cash += cash_refund
@@ -695,7 +695,7 @@ class BacktestEngine:
         for ot in open_trades:
             lookup = fast_lookup_by_asset.get(ot.asset)
             exit_bar = lookup.get_bar(ot.exit_time) if lookup else None
-            res, pnl, cash_refund = settle_position(ot, exit_bar, cfg.backtest.tie_policy)
+            res, pnl, cash_refund = settle_position(ot, exit_bar, cfg.trading.tie_policy)
             if res == "VOID":
                 skip_counts["data_gap_exit"] += 1
             cash += cash_refund

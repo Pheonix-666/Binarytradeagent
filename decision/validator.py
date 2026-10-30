@@ -20,10 +20,12 @@ PROJECT_SPEC.md Section 7.4 & Phase 7:
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import math
 from typing import Any, Optional, Union
 from pydantic import ValidationError
 
 from core.config import AppConfig
+from core.models import to_canonical_trade
 from decision.schema import DecisionOutput, DecisionReport, SystemState, ValidatedDecision
 from risk.stake import stake_amount
 
@@ -185,7 +187,8 @@ def validate_decision(
             )
 
         # Enforce portfolio exposure cap with floored stake
-        current_open_stakes = sum(float(getattr(ot, "stake", 0.0)) for ot in state.open_trades)
+        canonical_open = [to_canonical_trade(ot) for ot in state.open_trades]
+        current_open_stakes = sum(ot.stake for ot in canonical_open if not math.isnan(ot.stake))
         max_allowed_exposure = (config.stake.total_cap_pct / 100.0) * equity
         if (current_open_stakes + computed_stake) > (max_allowed_exposure + 1e-4):
             return ValidatedDecision(
@@ -295,9 +298,43 @@ def validate_decision(
             )
 
         # Check adverse price movement
+        asset_mode = state.asset_modes.get(asset, "paper")
+        is_real = (asset_mode == "live_eligible")
         curr_price = state.current_prices.get(asset)
+
+        if is_real and curr_price is None:
+            return ValidatedDecision(
+                decision="SKIP",
+                is_valid=False,
+                skip_reason=f"missing_current_price: current price required for real trading on {asset}",
+                checks_passed=passed_checks,
+                raw_decision=decision_out,
+            )
+
+        if is_real and (matched_cand.atr is None or matched_cand.atr <= 0):
+            if getattr(config.llm, "default_atr", None) is None or config.llm.default_atr <= 0:
+                return ValidatedDecision(
+                    decision="SKIP",
+                    is_valid=False,
+                    skip_reason=f"missing_atr: valid ATR required for real candidate on {asset}",
+                    checks_passed=passed_checks,
+                    raw_decision=decision_out,
+                )
+
         if curr_price is not None and matched_cand.current_price is not None:
-            atr = matched_cand.atr if (matched_cand.atr and matched_cand.atr > 0) else 0.001
+            if matched_cand.atr and matched_cand.atr > 0:
+                atr = matched_cand.atr
+            elif getattr(config.llm, "default_atr", None) is not None and config.llm.default_atr > 0:
+                atr = config.llm.default_atr
+            else:
+                return ValidatedDecision(
+                    decision="SKIP",
+                    is_valid=False,
+                    skip_reason=f"missing_atr: valid ATR required for price move check on {asset}",
+                    checks_passed=passed_checks,
+                    raw_decision=decision_out,
+                )
+
             max_move_atr = getattr(config.llm, "max_price_move_atr", 0.25)
             max_allowed_adverse_delta = max_move_atr * atr
 
@@ -322,19 +359,14 @@ def validate_decision(
 
         passed_checks.append("check_f_timing_and_price")
 
-        # Check g: No open trade in opposite direction on same asset
+        # Check g: No open trade in opposite direction on same asset (canonical trade support)
         for ot in state.open_trades:
-            ot_asset = getattr(ot, "asset", "")
-            ot_dir = getattr(ot, "direction", "")
-            if hasattr(ot_dir, "value"):
-                ot_dir = ot_dir.value
-            ot_dir_str = str(ot_dir).upper()
-
-            if ot_asset == asset and ot_dir_str != direction:
+            c_ot = to_canonical_trade(ot)
+            if c_ot.asset == asset and c_ot.direction in ("CALL", "PUT") and c_ot.direction != direction:
                 return ValidatedDecision(
                     decision="SKIP",
                     is_valid=False,
-                    skip_reason=f"opposite_direction_open_trade: active {ot_dir_str} on {asset}",
+                    skip_reason=f"opposite_direction_open_trade: active {c_ot.direction} on {asset}",
                     checks_passed=passed_checks,
                     raw_decision=decision_out,
                 )

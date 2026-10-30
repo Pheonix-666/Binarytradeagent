@@ -22,11 +22,13 @@ class PaperAdapter(PlatformAdapter):
         initial_balance: float = 1000.0,
         store: Optional[DataStore] = None,
         default_payout: float = 0.85,
+        tie_policy: str = "loss",
     ):
         self.balance = float(initial_balance)
         self.initial_balance = float(initial_balance)
         self.store = store
         self.default_payout = default_payout
+        self.tie_policy = tie_policy
         self._assets: dict[str, AssetQuote] = {}
         self._candles: dict[str, dict[str, pd.DataFrame]] = {}  # {asset: {tf: df}}
         self._open_trades: list[Trade] = []
@@ -99,9 +101,11 @@ class PaperAdapter(PlatformAdapter):
     def place_trade(
         self,
         asset_id: str,
-        direction: TradeDirection,
+        direction: TradeDirection | str,
         expiry_min: int,
         stake_amount: float,
+        trade_id: Optional[str] = None,
+        **kwargs: Any,
     ) -> TradeReceipt:
         """Execute a simulated fixed-time trade."""
         if stake_amount <= 0:
@@ -111,16 +115,19 @@ class PaperAdapter(PlatformAdapter):
                 f"Insufficient balance: stake={stake_amount} > balance={self.balance}"
             )
 
+        if isinstance(direction, str):
+            direction = TradeDirection(direction.upper())
+
         entry_time = self._current_time or now_utc()
         entry_price = self._get_current_price(asset_id)
         payout = self._get_payout(asset_id)
-        trade_id = f"paper_{uuid.uuid4().hex[:10]}"
+        tid = trade_id or f"paper_{uuid.uuid4().hex[:10]}"
 
         # Deduct stake from available balance
         self.balance -= stake_amount
 
         receipt = TradeReceipt(
-            trade_id=trade_id,
+            trade_id=tid,
             asset_id=asset_id,
             direction=direction,
             expiry_minutes=expiry_min,
@@ -128,6 +135,7 @@ class PaperAdapter(PlatformAdapter):
             entry_price=entry_price,
             entry_time=entry_time,
             payout=payout,
+            platform_trade_id=tid,
         )
 
         open_trade = Trade(
@@ -180,11 +188,13 @@ class PaperAdapter(PlatformAdapter):
             expiry_time = trade.entry_time + timedelta(minutes=trade.expiry_minutes)
             if now >= expiry_time:
                 # Find exit price
+                asset = getattr(trade, "asset_id", getattr(trade, "asset", ""))
+                stake = float(getattr(trade, "stake_amount", getattr(trade, "stake", 0.0)))
                 exit_price = None
-                if prices_at_expiry and trade.asset_id in prices_at_expiry:
-                    exit_price = prices_at_expiry[trade.asset_id]
+                if prices_at_expiry and asset in prices_at_expiry:
+                    exit_price = prices_at_expiry[asset]
                 else:
-                    exit_price = self._get_current_price(trade.asset_id)
+                    exit_price = self._get_current_price(asset)
 
                 # Determine outcome
                 if trade.direction == TradeDirection.CALL:
@@ -193,33 +203,35 @@ class PaperAdapter(PlatformAdapter):
                     elif exit_price < trade.entry_price:
                         outcome = TradeResult.LOSS
                     else:
-                        outcome = TradeResult.PENDING  # tie
+                        outcome = TradeResult.TIE
                 else:  # PUT
                     if exit_price < trade.entry_price:
                         outcome = TradeResult.WIN
                     elif exit_price > trade.entry_price:
                         outcome = TradeResult.LOSS
                     else:
-                        outcome = TradeResult.PENDING  # tie
+                        outcome = TradeResult.TIE
 
                 # Payout computation
                 payout_rate = trade.payout
                 if outcome == TradeResult.WIN:
-                    payout_received = trade.stake_amount * (1.0 + payout_rate)
+                    payout_received = stake * (1.0 + payout_rate)
                     self.balance += payout_received
-                elif outcome == TradeResult.PENDING:  # Tie / push: refund stake
-                    payout_received = trade.stake_amount
-                    self.balance += payout_received
-                    outcome = TradeResult.WIN  # Marked as push or win
+                elif outcome == TradeResult.TIE:
+                    if self.tie_policy == "refund":
+                        payout_received = stake
+                        self.balance += payout_received
+                    else:
+                        payout_received = 0.0
                 else:
                     payout_received = 0.0
 
                 settled_trade = Trade(
                     trade_id=trade.trade_id,
-                    asset_id=trade.asset_id,
+                    asset_id=asset,
                     direction=trade.direction,
                     expiry_minutes=trade.expiry_minutes,
-                    stake_amount=trade.stake_amount,
+                    stake_amount=stake,
                     entry_price=trade.entry_price,
                     entry_time=trade.entry_time,
                     payout=trade.payout,

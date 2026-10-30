@@ -45,9 +45,10 @@ from safety.limits import AccountSnapshot
 class FakeBrokerAdapter:
     """Mock broker adapter for testing order placement and verification."""
 
-    def __init__(self, balance: float = 10000.0, open_trades: list = None):
+    def __init__(self, balance: float = 10000.0, open_trades: list = None, trade_history: list = None):
         self.balance = balance
         self.open_trades = list(open_trades or [])
+        self.trade_history = list(trade_history or [])
         self.placed_orders = []
         self.should_fail_placement = False
         self.should_omit_from_open_trades = False  # Simulates verification failure
@@ -58,22 +59,47 @@ class FakeBrokerAdapter:
     def get_open_trades(self) -> list:
         return list(self.open_trades)
 
-    def place_order(self, asset: str, direction: str, expiry_minutes: int, stake: float, trade_id: str):
+    def get_trade_history(self, since: Optional[datetime] = None) -> list:
+        return list(self.trade_history)
+
+    def place_trade(
+        self,
+        asset_id: str,
+        direction: Any,
+        expiry_min: int,
+        stake_amount: float,
+        trade_id: Optional[str] = None,
+        **kwargs,
+    ):
         if self.should_fail_placement:
             raise RuntimeError("Broker placement failed: 503 Service Unavailable")
 
+        dir_str = str(getattr(direction, "value", direction)).upper()
+        tid = trade_id or "fake_tid_123"
         order_record = {
-            "id": trade_id,
-            "asset": asset,
-            "direction": direction,
-            "expiry_minutes": expiry_minutes,
-            "stake": stake,
+            "id": tid,
+            "asset": asset_id,
+            "direction": dir_str,
+            "expiry_minutes": expiry_min,
+            "stake": stake_amount,
             "status": "OPEN",
         }
         self.placed_orders.append(order_record)
         if not self.should_omit_from_open_trades:
             self.open_trades.append(order_record)
-        return order_record
+        from core.models import TradeDirection, TradeReceipt
+        return TradeReceipt(
+            trade_id=tid,
+            platform_trade_id=tid,
+            asset_id=asset_id,
+            direction=TradeDirection(dir_str),
+            expiry_minutes=expiry_min,
+            stake_amount=stake_amount,
+            entry_price=1.0,
+            entry_time=datetime.now(timezone.utc),
+            payout=0.85,
+            status="OPEN",
+        )
 
 
 class MockAlerter:
@@ -232,6 +258,8 @@ def test_reconcile_startup_unknown_trades_trips_breaker(config):
 
 
 def _make_validated_decision(asset="EURUSD", direction="CALL", stake_amount=200.0, stake_pct=2.0) -> ValidatedDecision:
+    import uuid
+    dec_id = f"dec_{uuid.uuid4().hex[:12]}"
     return ValidatedDecision(
         decision=direction,
         is_valid=True,
@@ -240,6 +268,7 @@ def _make_validated_decision(asset="EURUSD", direction="CALL", stake_amount=200.
         direction=direction,
         expiry_minutes=15,
         stake_pct=stake_pct,
+        decision_id=dec_id,
         evidence=DecisionEvidence(risk_score=30, similarity=85.0, trend_daily="up", trend_1h="up", payout=0.85),
         reasoning="Valid high similarity candidate",
         checks_passed=["check_a", "check_b", "check_c", "check_d", "check_e", "check_f", "check_g", "check_h"],
@@ -248,6 +277,7 @@ def _make_validated_decision(asset="EURUSD", direction="CALL", stake_amount=200.
             asset=asset,
             expiry_minutes=15,
             stake_pct=stake_pct,
+            decision_id=dec_id,
             evidence=DecisionEvidence(risk_score=30, similarity=85.0, trend_daily="up", trend_1h="up", payout=0.85),
             reasoning="Valid high similarity candidate",
         ),
@@ -433,17 +463,28 @@ def test_reset_breaker_works_and_is_chat_id_restricted(config, tmp_path):
     unauth_update = {
         "message": {
             "chat": {"id": "999999999"},
-            "text": "/reset_breaker",
+            "text": "/reset_breaker confirm",
         }
     }
     assert alerter.handle_incoming_update(unauth_update) is None
     assert breaker.is_tripped() is True
 
-    # 2. Authorized chat_id issues /reset_breaker -> Reset executed, breaker restored
-    auth_update = {
+    # 1b. Authorized without confirm keyword -> requires explicit confirmation
+    unconf_update = {
         "message": {
             "chat": {"id": "123456789"},
             "text": "/reset_breaker",
+        }
+    }
+    res_unconf = alerter.handle_incoming_update(unconf_update)
+    assert "requires explicit confirmation" in res_unconf
+    assert breaker.is_tripped() is True
+
+    # 2. Authorized chat_id issues /reset_breaker confirm -> Reset executed, breaker restored
+    auth_update = {
+        "message": {
+            "chat": {"id": "123456789"},
+            "text": "/reset_breaker confirm",
         }
     }
     res = alerter.handle_incoming_update(auth_update)

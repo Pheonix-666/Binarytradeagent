@@ -1102,10 +1102,22 @@ def test_check_order_disabled_adaptive_allows_real_orders_via_explicit_normal_st
             self.placed = []
         def get_balance(self): return 10000.0
         def get_open_trades(self): return self.placed
-        def place_order(self, asset, direction, expiry_minutes, stake, trade_id):
-            trade = {"id": trade_id, "asset": asset, "direction": direction, "expiry_minutes": expiry_minutes, "stake": stake}
+        def place_trade(self, asset_id, direction, expiry_min, stake_amount, trade_id=None, **kwargs):
+            tid = trade_id or "test_tid"
+            trade = {"id": tid, "asset": asset_id, "direction": str(getattr(direction, "value", direction)), "expiry_minutes": expiry_min, "stake": stake_amount}
             self.placed.append(trade)
-            return trade
+            from core.models import TradeDirection, TradeReceipt
+            return TradeReceipt(
+                trade_id=tid,
+                platform_trade_id=tid,
+                asset_id=asset_id,
+                direction=TradeDirection(str(getattr(direction, "value", direction)).upper()),
+                expiry_minutes=expiry_min,
+                stake_amount=stake_amount,
+                entry_price=1.0,
+                entry_time=datetime.now(timezone.utc),
+                payout=0.85,
+            )
 
     adapter = DummyAdapter()
     tm = TradeManager(cfg, state_mgr, breaker, ks, adapter)
@@ -1115,11 +1127,12 @@ def test_check_order_disabled_adaptive_allows_real_orders_via_explicit_normal_st
         decision="CALL",
         direction="CALL",
         is_valid=True,
+        decision_id="dec_disabled_ad_01",
         stake_amount=200.0,
         stake_pct=2.0,
         expiry_minutes=15,
         evidence=DecisionEvidence(risk_score=20, similarity=85.0, trend_daily="up", trend_1h="up", payout=0.85),
-        raw_decision=DecisionOutput(decision="CALL", asset="EURUSD", expiry_minutes=15, stake_pct=2.0, reasoning="test"),
+        raw_decision=DecisionOutput(decision="CALL", asset="EURUSD", expiry_minutes=15, stake_pct=2.0, reasoning="test", decision_id="dec_disabled_ad_01"),
         asset="EURUSD",
     )
     exec_res = tm.execute(dec, account=account, adaptive_state=None)

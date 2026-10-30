@@ -13,10 +13,11 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
-from typing import Any, Optional, Sequence
+from typing import Any, Optional, Sequence, Union
+import uuid
 
 from analysis.candidates import CandidateTrade
-from core.config import AppConfig
+from core.config import AppConfig, resolve_project_path
 from core.logging_setup import get_logger
 from decision.llm_client import LLMClient, LLMResponse, LLMUnavailable
 from decision.parser import ParseError, parse_strict_json
@@ -32,7 +33,7 @@ class DecisionService:
     """Manages the full LLM trading decision lifecycle."""
 
     def __init__(self, log_path: Union[str, Path] = "logs/decisions.jsonl"):
-        self.log_path = Path(log_path)
+        self.log_path = resolve_project_path(log_path)
         self.call_timestamps: list[datetime] = []
 
     def _check_rate_limit(self, max_calls_per_hour: int, now: datetime) -> bool:
@@ -68,32 +69,69 @@ class DecisionService:
         else:
             now_utc = now.astimezone(timezone.utc)
 
+        # Generate a unique decision_id for every decision
+        decision_id = f"dec_{uuid.uuid4().hex[:12]}"
+
         # 1. Zero candidate guard: return SKIP immediately without calling the LLM
         if not candidates:
-            return ValidatedDecision(
+            res = ValidatedDecision(
                 decision="SKIP",
                 is_valid=True,
+                decision_id=decision_id,
                 reasoning="No trade candidates available",
                 skip_reason="no_candidates",
                 checks_passed=["zero_candidate_guard"],
             )
+            self._log_decision({
+                "timestamp": now_utc.isoformat(),
+                "decision_id": decision_id,
+                "prompt_version": PROMPT_VERSION,
+                "report": None,
+                "raw_output": "",
+                "parsed_output": None,
+                "validator_result": "SKIP",
+                "is_valid": True,
+                "stake_amount": None,
+                "skip_reason": "no_candidates",
+                "checks_passed": ["zero_candidate_guard"],
+                "token_usage": {"prompt_tokens": 0, "completion_tokens": 0},
+                "latency_seconds": 0.0,
+            })
+            return res
 
         # 2. Hourly cost / rate-limit guard
         max_calls = getattr(config.llm, "max_calls_per_hour", 60)
         if not self._check_rate_limit(max_calls, now_utc):
             logger.warning(f"LLM decision rate limit reached ({max_calls}/hour). Skipping.")
-            return ValidatedDecision(
+            res = ValidatedDecision(
                 decision="SKIP",
                 is_valid=False,
+                decision_id=decision_id,
                 reasoning="LLM rate limit reached for current hour",
                 skip_reason="llm_rate_limit",
                 checks_passed=[],
             )
+            self._log_decision({
+                "timestamp": now_utc.isoformat(),
+                "decision_id": decision_id,
+                "prompt_version": PROMPT_VERSION,
+                "report": None,
+                "raw_output": "",
+                "parsed_output": None,
+                "validator_result": "SKIP",
+                "is_valid": False,
+                "stake_amount": None,
+                "skip_reason": "llm_rate_limit",
+                "checks_passed": [],
+                "token_usage": {"prompt_tokens": 0, "completion_tokens": 0},
+                "latency_seconds": 0.0,
+            })
+            return res
 
         # 3. Build input report
         report = build_report(
             candidates=candidates,
-            balance=getattr(state, "balance", 10000.0),
+            balance=float(getattr(state, "balance", 0.0)),
             open_trades=state.open_trades,
             config=config,
             now=now_utc,
@@ -118,11 +156,13 @@ class DecisionService:
             skip_res = ValidatedDecision(
                 decision="SKIP",
                 is_valid=False,
+                decision_id=decision_id,
                 skip_reason=f"llm_unavailable: {exc}",
                 checks_passed=[],
             )
             self._log_decision({
                 "timestamp": now_utc.isoformat(),
+                "decision_id": decision_id,
                 "prompt_version": PROMPT_VERSION,
                 "report": report.model_dump(),
                 "raw_output": str(exc),
@@ -144,11 +184,13 @@ class DecisionService:
             skip_res = ValidatedDecision(
                 decision="SKIP",
                 is_valid=False,
+                decision_id=decision_id,
                 skip_reason=f"parse_error: {exc}",
                 checks_passed=[],
             )
             self._log_decision({
                 "timestamp": now_utc.isoformat(),
+                "decision_id": decision_id,
                 "prompt_version": PROMPT_VERSION,
                 "report": report.model_dump(),
                 "raw_output": raw_output,
@@ -171,10 +213,12 @@ class DecisionService:
             config=config,
             now=now_utc,
         )
+        validated.decision_id = decision_id
 
         # 7. Audit Logging (one JSONL line per decision)
         self._log_decision({
             "timestamp": now_utc.isoformat(),
+            "decision_id": decision_id,
             "prompt_version": PROMPT_VERSION,
             "report": report.model_dump(),
             "raw_output": raw_output,

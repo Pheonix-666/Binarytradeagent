@@ -14,6 +14,9 @@ from pathlib import Path
 from typing import Optional
 
 
+from core.config import resolve_project_path
+
+
 class KillSwitch:
     """Manages manual emergency stop via KILL file or Telegram flag."""
 
@@ -23,7 +26,7 @@ class KillSwitch:
         workspace_root: Optional[Path] = None,
     ):
         self.kill_file_name = kill_file
-        self.workspace_root = workspace_root or Path.cwd()
+        self.workspace_root = Path(workspace_root) if workspace_root else resolve_project_path(".")
         self._telegram_stop_active: bool = False
 
     @property

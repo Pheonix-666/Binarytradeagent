@@ -499,11 +499,11 @@ def test_service_hourly_rate_limit(config, sample_candidate, valid_decision_dict
 
     # 3 calls permitted
     for _ in range(3):
-        r = service.decide(candidates=[sample_candidate], state=SystemState(), config=cfg, client=fake_client, now=now)
+        r = service.decide(candidates=[sample_candidate], state=SystemState(balance=10000.0), config=cfg, client=fake_client, now=now)
         assert r.is_valid is True
 
     # 4th call is rate-limited before reaching LLM
-    r4 = service.decide(candidates=[sample_candidate], state=SystemState(), config=cfg, client=fake_client, now=now)
+    r4 = service.decide(candidates=[sample_candidate], state=SystemState(balance=10000.0), config=cfg, client=fake_client, now=now)
     assert r4.decision == "SKIP"
     assert r4.skip_reason == "llm_rate_limit"
     assert fake_client.call_count == 3

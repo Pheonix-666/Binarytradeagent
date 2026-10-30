@@ -10,6 +10,17 @@ import yaml
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
+PROJECT_ROOT: Path = Path(__file__).resolve().parent.parent
+
+
+def resolve_project_path(p: str | Path) -> Path:
+    """Resolve a relative path against the absolute project root."""
+    path = Path(p)
+    if path.is_absolute():
+        return path
+    return (PROJECT_ROOT / path).resolve()
+
+
 # ── Nested config models ──────────────────────────────────────────────
 
 
@@ -51,6 +62,7 @@ class TradingConfig(BaseModel):
     top_assets: int = Field(ge=1)
     max_measured_slots: int = Field(ge=0)
     min_trades_for_stats: int = Field(ge=1)
+    tie_policy: Literal["refund", "loss"] = Field(default="loss")
 
     @model_validator(mode="after")
     def _validate_expiry(self) -> "TradingConfig":
@@ -286,6 +298,7 @@ class SafetyConfig(BaseModel):
     rounding_tolerance: float = Field(ge=0, default=0.001)
     stake_verification_tolerance: float = Field(ge=0, default=0.01)
     rate_limit_window_minutes: int = Field(ge=1, default=10)
+    max_alert_failures: int = Field(ge=1, default=5)
 
 
 class LLMConfig(BaseModel):
@@ -300,6 +313,7 @@ class LLMConfig(BaseModel):
     max_price_move_atr: float = Field(gt=0, default=0.25)
     evidence_float_tolerance: float = Field(ge=0, default=0.01)
     max_calls_per_hour: int = Field(ge=1, default=60)
+    default_atr: Optional[float] = Field(default=None)
 
 
 class AlertsConfig(BaseModel):
@@ -320,7 +334,7 @@ class BacktestConfig(BaseModel):
     stake_policy: Literal["max", "mid", "min"] = "max"
     entry_delay_bars: int = Field(ge=0, default=1)
     slippage_atr: float = Field(ge=0, default=0.02)
-    tie_policy: Literal["refund", "loss"] = "loss"
+    tie_policy: Optional[Literal["refund", "loss"]] = Field(default=None)
     ignore_paper_gate: bool = Field(default=True)
     max_llm_steps: int = Field(ge=1, default=200)
 
@@ -490,6 +504,15 @@ class AppConfig(BaseModel):
     alerts: AlertsConfig
     backtest: BacktestConfig
     adaptive: AdaptiveConfig = Field(default_factory=AdaptiveConfig)
+
+    @model_validator(mode="after")
+    def _sync_tie_policy(self) -> "AppConfig":
+        if hasattr(self, "backtest") and hasattr(self, "trading"):
+            if self.backtest.tie_policy is None:
+                self.backtest.tie_policy = self.trading.tie_policy
+            else:
+                self.trading.tie_policy = self.backtest.tie_policy
+        return self
 
 
 # ── Loader ────────────────────────────────────────────────────────────

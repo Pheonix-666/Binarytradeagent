@@ -169,7 +169,8 @@ def test_paper_adapter_settle_put_loss(paper_adapter):
 
 
 def test_paper_adapter_settle_tie_refunds_stake(paper_adapter):
-    """Tie (exit_price == entry_price) refunds stake amount."""
+    """Tie (exit_price == entry_price) refunds stake amount when tie_policy is refund."""
+    paper_adapter.tie_policy = "refund"
     start_time = datetime(2026, 10, 29, 10, 0, 0, tzinfo=timezone.utc)
     paper_adapter.set_simulated_time(start_time)
 

@@ -8,7 +8,9 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-_LOGS_DIR = Path("logs")
+from core.config import resolve_project_path
+
+_LOGS_DIR = resolve_project_path("logs")
 _LOGS_DIR.mkdir(exist_ok=True)
 
 

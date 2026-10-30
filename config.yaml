@@ -39,6 +39,7 @@ trading:
   top_assets: 5
   max_measured_slots: 3
   min_trades_for_stats: 30
+  tie_policy: "loss"        # refund | loss
 
 stake:
   min_pct: 1
@@ -152,6 +153,7 @@ llm:
   max_price_move_atr: 0.25
   evidence_float_tolerance: 0.01
   max_calls_per_hour: 60
+  default_atr: null
 
 alerts:
   telegram_enabled: true
@@ -166,7 +168,6 @@ backtest:
   stake_policy: "max"             # max | mid | min
   entry_delay_bars: 1
   slippage_atr: 0.02
-  tie_policy: "loss"              # refund | loss
   ignore_paper_gate: true
   max_llm_steps: 200
 

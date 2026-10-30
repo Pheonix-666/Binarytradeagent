@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
+import math
 from typing import Any, Optional
 
 from core.config import AppConfig
@@ -173,13 +174,20 @@ class CircuitBreaker:
         tol = (
             tolerance
             if tolerance is not None
-            else getattr(self.config.safety, "balance_tolerance", 1.0)
+            else self.config.safety.balance_tolerance
             if hasattr(self.config, "safety")
             else 1.0
         )
 
         if reported_balance is None:
             self.trip("Balance read failure from broker/adapter", now=now_dt)
+            return False
+
+        if not math.isfinite(reported_balance) or not math.isfinite(expected_balance):
+            self.trip(
+                f"Balance mismatch: non-finite balance reported (reported={reported_balance}, expected={expected_balance})",
+                now=now_dt,
+            )
             return False
 
         diff = abs(reported_balance - expected_balance)

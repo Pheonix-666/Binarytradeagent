@@ -131,6 +131,7 @@ class DecisionOutput(BaseModel):
     stake_pct: Optional[float] = None
     evidence: Optional[DecisionEvidence] = None
     reasoning: str
+    decision_id: Optional[str] = None
 
     @field_validator("reasoning")
     @classmethod
@@ -148,7 +149,7 @@ class DecisionOutput(BaseModel):
 class SystemState:
     """Runtime system state passed to the validator."""
 
-    balance: float = 10000.0
+    balance: float = 0.0
     kill_switch_active: bool = False
     breaker_tripped: bool = False
     reconcile_done: bool = True
@@ -164,6 +165,7 @@ class ValidatedDecision:
 
     decision: Literal["CALL", "PUT", "SKIP"]
     is_valid: bool
+    decision_id: Optional[str] = None
     stake_amount: Optional[float] = None
     asset: Optional[str] = None
     direction: Optional[str] = None
