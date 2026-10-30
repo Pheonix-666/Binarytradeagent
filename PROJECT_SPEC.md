@@ -164,7 +164,7 @@ paper_gate:
   min_edge_margin: 0.02       # win rate must exceed break-even by this much
 
 safety:
-  max_orders_per_10min: 6
+  max_orders_per_window: 6
   stale_data_multiplier: 2    # data older than 2x check interval pauses trading
   max_consecutive_exec_errors: 3
   kill_file: KILL
@@ -207,6 +207,15 @@ class PlatformAdapter(ABC):
 - **PaperAdapter:** uses recorded or live-read candles. Simulates trades: settles by comparing the entry price to the price at expiry, using the payout recorded at entry. No clicks.
 - **PlaywrightAdapter:** see Phase 1 (discovery, read-only) and Phase 10 (trading). The user logs in manually in a persistent browser profile; credentials are never in code.
 - **Candle builder:** if the platform only exposes ticks, build 1m candles from ticks, then resample to 5m/15m/1h/1d. Only closed candles are used for signals.
+
+### 6.1.1 Historical Candle Data (`tools/convert_history.py`)
+
+Historical 1-minute files are converted to `data_history/<ASSET>.csv` with columns `ts,open,high,low,close` in UTC:
+- **Timestamp convention:** `ts` MUST always be the candle **OPEN** time in UTC.
+- For Binance klines, `open_time` is used.
+- For HistData M1, timestamps represent the start of the minute (open time).
+- For any data source providing candle close times instead, specify `--ts-is-close` to shift timestamps back one minute (`ts = ts - 1 minute`) so stored candles represent open time.
+- Sorts chronologically, de-duplicates timestamps (reporting identical vs different-price duplicates and keeping the first row), validates price bounds (`high >= max(open, close)`, `low <= min(open, close)`, `open/high/low/close > 0`), and prints a calendar-aware gap report where scheduled market closures (e.g. forex weekends) are excluded.
 
 ### 6.2 Trend analyzer (`analysis/trend.py`)
 
@@ -376,7 +385,7 @@ Plain code. The LLM cannot read, change, or bypass it.
 - **Stake limits:** each stake between `min_pct` and `max_pct` of balance, total open stakes at most `total_cap_pct`.
 - **No opposite trades** on the same asset at once.
 - **Malfunction breaker:** pause trading and alert if any of these happen:
-  - more than `max_orders_per_10min` orders in 10 minutes
+  - more than `max_orders_per_window` orders in the rate limit window (`rate_limit_window_minutes`)
   - price data older than `stale_data_multiplier` x check interval
   - `max_consecutive_exec_errors` execution errors in a row
   - balance read fails or changes in a way that doesn't match recorded trades

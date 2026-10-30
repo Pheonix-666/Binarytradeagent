@@ -458,4 +458,83 @@ def test_resampled_bars_ts_close_is_bucket_end():
             )
 
 
+def test_forex_calendar_dst_summer_and_winter_boundaries():
+    """Forex weekly_windows defined in America/New_York (Sun 17:00 to Fri 17:00)
+
+    properly convert to UTC per date, handling DST:
+      - Summer (EDT = UTC-4): closes Friday 21:00 UTC, reopens Sunday 21:00 UTC.
+      - Winter (EST = UTC-5): closes Friday 22:00 UTC, reopens Sunday 22:00 UTC.
+    """
+    from core.config import CalendarConfig, CalendarWindowConfig
+    from data.calendar import is_market_open
+    from data.candle_builder import detect_gaps
+
+    forex_cal = CalendarConfig(
+        type="weekly_windows",
+        daily_boundary_tz="America/New_York",
+        daily_boundary_hour=17,
+        windows=[
+            CalendarWindowConfig(
+                open_day="Sun",
+                open_time="17:00",
+                close_day="Fri",
+                close_time="17:00",
+                tz="America/New_York",
+            )
+        ],
+    )
+
+    # 1. Summer week (July 2021) - EDT is UTC-4:
+    # Fri 2021-07-02 17:00 EDT = 21:00 UTC
+    fri_summer_open = datetime(2021, 7, 2, 20, 59, 0, tzinfo=timezone.utc)
+    fri_summer_close = datetime(2021, 7, 2, 21, 0, 0, tzinfo=timezone.utc)
+    fri_summer_closed = datetime(2021, 7, 2, 21, 1, 0, tzinfo=timezone.utc)
+
+    assert is_market_open(fri_summer_open, forex_cal) is True
+    assert is_market_open(fri_summer_close, forex_cal) is False
+    assert is_market_open(fri_summer_closed, forex_cal) is False
+
+    # Sun 2021-07-04 17:00 EDT = 21:00 UTC
+    sun_summer_closed = datetime(2021, 7, 4, 20, 59, 0, tzinfo=timezone.utc)
+    sun_summer_open = datetime(2021, 7, 4, 21, 0, 0, tzinfo=timezone.utc)
+    sun_summer_opened = datetime(2021, 7, 4, 21, 1, 0, tzinfo=timezone.utc)
+
+    assert is_market_open(sun_summer_closed, forex_cal) is False
+    assert is_market_open(sun_summer_open, forex_cal) is True
+    assert is_market_open(sun_summer_opened, forex_cal) is True
+
+    # 2. Winter week (January 2021) - EST is UTC-5:
+    # Fri 2021-01-08 17:00 EST = 22:00 UTC
+    fri_winter_open = datetime(2021, 1, 8, 21, 59, 0, tzinfo=timezone.utc)
+    fri_winter_close = datetime(2021, 1, 8, 22, 0, 0, tzinfo=timezone.utc)
+    fri_winter_closed = datetime(2021, 1, 8, 22, 1, 0, tzinfo=timezone.utc)
+
+    assert is_market_open(fri_winter_open, forex_cal) is True
+    assert is_market_open(fri_winter_close, forex_cal) is False
+    assert is_market_open(fri_winter_closed, forex_cal) is False
+
+    # Sun 2021-01-10 17:00 EST = 22:00 UTC
+    sun_winter_closed = datetime(2021, 1, 10, 21, 59, 0, tzinfo=timezone.utc)
+    sun_winter_open = datetime(2021, 1, 10, 22, 0, 0, tzinfo=timezone.utc)
+    sun_winter_opened = datetime(2021, 1, 10, 22, 1, 0, tzinfo=timezone.utc)
+
+    assert is_market_open(sun_winter_closed, forex_cal) is False
+    assert is_market_open(sun_winter_open, forex_cal) is True
+    assert is_market_open(sun_winter_opened, forex_cal) is True
+
+    # 3. Gap detector over summer and winter weekends: 0 unexpected gaps
+    df_summer = pd.DataFrame([
+        {"ts": fri_summer_open, "open": 1.1, "high": 1.11, "low": 1.09, "close": 1.1, "volume": 1},
+        {"ts": sun_summer_open, "open": 1.1, "high": 1.11, "low": 1.09, "close": 1.1, "volume": 1},
+    ])
+    assert detect_gaps(df_summer, timeframe="1m", calendar=forex_cal) == []
+
+    df_winter = pd.DataFrame([
+        {"ts": fri_winter_open, "open": 1.1, "high": 1.11, "low": 1.09, "close": 1.1, "volume": 1},
+        {"ts": sun_winter_open, "open": 1.1, "high": 1.11, "low": 1.09, "close": 1.1, "volume": 1},
+    ])
+    assert detect_gaps(df_winter, timeframe="1m", calendar=forex_cal) == []
+
+
+
 

@@ -12,3 +12,5 @@ build/
 venv/
 data_history/
 docs/backtests/
+collected.txt
+pytest_out.txt

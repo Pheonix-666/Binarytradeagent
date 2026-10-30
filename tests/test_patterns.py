@@ -274,6 +274,7 @@ def test_dtw_shortlist_refined_flag_and_sorting(library):
 # ── Performance Benchmark Test ────────────────────────────────────────
 
 
+@pytest.mark.perf
 def test_performance_benchmark(tmp_path):
     """Performance requirement: 4 assets x 4 window lengths x 20 templates in under 50 ms.
 

@@ -2,7 +2,7 @@
 
 PROJECT_SPEC.md Section 8 (Safety Layer):
   - Pause trading and alert if any happen:
-      1. More than max_orders_per_10min orders in 10 minutes.
+      1. More than max_orders_per_window orders in safety.rate_limit_window_minutes.
       2. Price data older than stale_data_multiplier * check_interval.
       3. max_consecutive_exec_errors execution errors in a row.
       4. Balance read fails or changes in a way that doesn't match recorded trades.
@@ -27,7 +27,6 @@ class BreakerState:
     trip_reason: Optional[str] = None
     tripped_at: Optional[str] = None
     consecutive_exec_errors: int = 0
-    consecutive_trade_losses: int = 0
     recent_order_timestamps: list[str] = field(default_factory=list)
     last_trip_history: list[dict[str, Any]] = field(default_factory=list)
 
@@ -59,42 +58,12 @@ class CircuitBreaker:
             "reason": reason,
         })
 
-    def reset(self, force: bool = False, now: Optional[datetime] = None) -> bool:
-        """Manually reset the circuit breaker (explicit operator command only).
-
-        If breaker_cooldown_seconds is configured, cannot reset before cooldown expires unless force=True.
-        """
-        now_dt = now or datetime.now(timezone.utc)
-        if self.state.tripped and not force:
-            cooldown_secs = getattr(getattr(self.config, "safety", None), "breaker_cooldown_seconds", 0)
-            if cooldown_secs and self.state.tripped_at:
-                tripped_time = datetime.fromisoformat(self.state.tripped_at)
-                if (now_dt - tripped_time).total_seconds() < cooldown_secs:
-                    return False
-
+    def reset(self) -> None:
+        """Manually reset the circuit breaker (explicit operator command only)."""
         self.state.tripped = False
         self.state.trip_reason = None
         self.state.tripped_at = None
         self.state.consecutive_exec_errors = 0
-        self.state.consecutive_trade_losses = 0
-        return True
-
-    def record_loss(self, now: Optional[datetime] = None) -> bool:
-        """Record consecutive trade loss and trip if threshold reached."""
-        now_dt = now or datetime.now(timezone.utc)
-        self.state.consecutive_trade_losses += 1
-        max_losses = getattr(getattr(self.config, "safety", None), "max_consecutive_losses", None)
-        if max_losses is not None and self.state.consecutive_trade_losses >= max_losses:
-            self.trip(
-                f"Consecutive trade losses: {self.state.consecutive_trade_losses} >= {max_losses}",
-                now=now_dt,
-            )
-            return False
-        return True
-
-    def record_win(self) -> None:
-        """Reset consecutive trade loss count on win."""
-        self.state.consecutive_trade_losses = 0
 
     def record_order(self, now: Optional[datetime] = None) -> bool:
         """Record an order placement and check rolling 10-minute rate limit.
@@ -106,20 +75,25 @@ class CircuitBreaker:
             return False
 
         now_dt = now or datetime.now(timezone.utc)
-        ten_mins_ago = now_dt - timedelta(minutes=10)
+        window_mins = (
+            getattr(self.config.safety, "rate_limit_window_minutes", 10)
+            if hasattr(self.config, "safety")
+            else 10
+        )
+        window_ago = now_dt - timedelta(minutes=window_mins)
 
-        # Filter order timestamps within last 10 minutes
+        # Filter order timestamps within rate limit window
         recent = [
             ts for ts in self.state.recent_order_timestamps
-            if datetime.fromisoformat(ts) >= ten_mins_ago
+            if datetime.fromisoformat(ts) >= window_ago
         ]
         recent.append(now_dt.isoformat())
         self.state.recent_order_timestamps = recent
 
-        max_orders = self.config.safety.max_orders_per_10min
+        max_orders = self.config.safety.max_orders_per_window
         if len(recent) > max_orders:
             self.trip(
-                f"Rate limit exceeded: {len(recent)} orders in 10 minutes > maximum {max_orders}",
+                f"Rate limit exceeded: {len(recent)} orders in {window_mins} minutes > maximum {max_orders}",
                 now=now_dt,
             )
             return False
@@ -187,7 +161,7 @@ class CircuitBreaker:
         self,
         reported_balance: Optional[float],
         expected_balance: float,
-        tolerance: float = 1.0,
+        tolerance: Optional[float] = None,
         now: Optional[datetime] = None,
     ) -> bool:
         """Verify broker reported balance matches expected trade-reconciled balance.
@@ -196,16 +170,23 @@ class CircuitBreaker:
             True if balance matches within tolerance, False if mismatch and breaker tripped.
         """
         now_dt = now or datetime.now(timezone.utc)
+        tol = (
+            tolerance
+            if tolerance is not None
+            else getattr(self.config.safety, "balance_tolerance", 1.0)
+            if hasattr(self.config, "safety")
+            else 1.0
+        )
 
         if reported_balance is None:
             self.trip("Balance read failure from broker/adapter", now=now_dt)
             return False
 
         diff = abs(reported_balance - expected_balance)
-        if diff > tolerance:
+        if diff > tol:
             self.trip(
                 f"Balance mismatch: reported ${reported_balance:,.2f} vs expected "
-                f"${expected_balance:,.2f} (diff ${diff:,.2f} > tolerance ${tolerance:,.2f})",
+                f"${expected_balance:,.2f} (diff ${diff:,.2f} > tolerance ${tol:,.2f})",
                 now=now_dt,
             )
             return False

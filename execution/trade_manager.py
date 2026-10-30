@@ -20,8 +20,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+import logging
 from typing import Any, Optional
 import uuid
+
+logger = logging.getLogger(__name__)
 
 from adaptive.monitor import AdaptiveState
 from core.config import AppConfig
@@ -30,6 +33,22 @@ from execution.state import StateManager
 from safety.breaker import CircuitBreaker
 from safety.killswitch import KillSwitch
 from safety.limits import AccountSnapshot, OrderRequest, check_order
+
+# Safety-critical reasons that are never throttled (always sent immediately)
+_SAFETY_CRITICAL_PREFIXES = (
+    "unknown direction",
+    "Verification failed",
+    "Verification FAILED",
+    "CRITICAL",
+    "Circuit breaker",
+    "Emergency kill switch",
+    "balance mismatch",
+    "Balance mismatch",
+)
+
+# Default throttle window in minutes: one non-critical "Trade blocked" alert
+# per (reason, asset) per this many minutes.
+_DEFAULT_ALERT_THROTTLE_MINUTES = 15
 
 
 @dataclass
@@ -51,6 +70,18 @@ class ExecutionResult:
 class TradeManager:
     """Orchestrates order verification, write-ahead logging, and placement."""
 
+    # Safety-critical reasons that are never throttled (always sent immediately)
+    _SAFETY_CRITICAL_PREFIXES = (
+        "unknown direction",
+        "Verification failed",
+        "Verification FAILED",
+        "CRITICAL",
+        "Circuit breaker",
+        "Emergency kill switch",
+        "balance mismatch",
+        "Balance mismatch",
+    )
+
     def __init__(
         self,
         config: AppConfig,
@@ -61,6 +92,7 @@ class TradeManager:
         paper_adapter: Optional[Any] = None,
         db_store: Optional[Any] = None,
         alerter: Optional[Any] = None,
+        alert_throttle_minutes: int = 15,
     ):
         self.config = config
         self.state_manager = state_manager
@@ -72,10 +104,65 @@ class TradeManager:
         self.alerter = alerter
         self.reconcile_done: bool = False
         self.executed_decision_ids: set[str] = set()
+        self.alert_throttle_minutes = alert_throttle_minutes
+        # Maps (reason_key, asset) -> (last_sent_dt, count_suppressed)
+        self._alert_throttle: dict[tuple[str, str], tuple[datetime, int]] = {}
 
     def set_reconciled(self, reconciled: bool = True) -> None:
         """Mark startup reconciliation status."""
         self.reconcile_done = reconciled
+
+    def _is_safety_critical(self, text: str) -> bool:
+        """Return True if this alert must never be throttled."""
+        return any(p in text for p in self._SAFETY_CRITICAL_PREFIXES)
+
+    def _throttled_alert(
+        self,
+        text: str,
+        asset: str = "",
+        now: Optional[datetime] = None,
+    ) -> None:
+        """Send an alert, throttling non-critical 'Trade blocked' messages.
+
+        Safety-critical alerts (unknown direction, verification failure, breaker
+        trip, kill switch) are always sent immediately.  Routine 'Trade blocked'
+        alerts are aggregated: at most one per (reason, asset) per
+        alert_throttle_minutes; if suppressed, the suppression count is included
+        in the next sent message.
+        """
+        if self.alerter is None:
+            return
+        now_dt = now or datetime.now(timezone.utc)
+
+        if self._is_safety_critical(text):
+            try:
+                self.alerter.send_alert(text)
+            except Exception as exc:
+                logger.error("Failed sending safety-critical alert: %s", exc)
+            return
+
+        # Derive a stable reason key (first 80 chars is enough for bucketing)
+        key = (text[:80], asset)
+        entry = self._alert_throttle.get(key)
+        if entry is not None:
+            last_sent, suppressed = entry
+            elapsed = (now_dt - last_sent).total_seconds() / 60.0
+            if elapsed < self.alert_throttle_minutes:
+                # Suppress — update count only
+                self._alert_throttle[key] = (last_sent, suppressed + 1)
+                logger.debug(
+                    "Alert throttled (%d suppressed so far): %s", suppressed + 1, text[:80]
+                )
+                return
+            # Window expired — include suppression count in the next message
+            if suppressed > 0:
+                text = f"{text} [+{suppressed} suppressed in last {self.alert_throttle_minutes}m]"
+
+        self._alert_throttle[key] = (now_dt, 0)
+        try:
+            self.alerter.send_alert(text)
+        except Exception as exc:
+            logger.error("Failed sending alert: %s", exc)
 
     def execute(
         self,
@@ -135,11 +222,18 @@ class TradeManager:
             return ExecutionResult(executed=False, status="VALIDATOR_FAILED", reason=msg, executed_at=now_iso)
 
         # ── Step 3 & 4: Determine shadow/real mode and check Safety limits ───
+        effective_adaptive_state = adaptive_state
+        if (
+            effective_adaptive_state is None
+            and getattr(getattr(self.config, "adaptive", None), "enabled", False) is False
+        ):
+            effective_adaptive_state = AdaptiveState()
+
         asset_mode = account.asset_modes.get(str(decision.asset), "paper")
         is_paper = (
             (asset_mode != "live_eligible")
             or bool(decision.shadow_only)
-            or (adaptive_state is not None and not adaptive_state.real_trading_allowed)
+            or (effective_adaptive_state is not None and not effective_adaptive_state.real_trading_allowed)
             or (self.config.mode == "paper")
         )
 
@@ -157,12 +251,24 @@ class TradeManager:
             order=order,
             account=account,
             config=self.config,
-            adaptive_state=adaptive_state,
+            adaptive_state=effective_adaptive_state,
         )
         if not safety_res.allowed:
             msg = f"Trade blocked by safety layer: {safety_res.reason}"
             if self.alerter:
-                self.alerter.send_alert(f"🛡️ {msg}")
+                if getattr(safety_res, "alert_required", False) and getattr(safety_res, "alert_text", ""):
+                    # Safety-critical: unknown direction etc. — never throttled
+                    try:
+                        self.alerter.send_alert(safety_res.alert_text)
+                    except Exception as e:
+                        logger.error(f"Failed sending alert for safety constraint: {e}")
+            # Routine "Trade blocked" alert — subject to per-asset-per-reason throttle
+            self._throttled_alert(
+                f"🛡️ {msg}",
+                asset=order.asset,
+                now=now_dt,
+            )
+
             return ExecutionResult(executed=False, status="BLOCKED_SAFETY", reason=msg, executed_at=now_iso)
 
         if is_paper:
@@ -395,10 +501,11 @@ class TradeManager:
                 direction = str(ot.get("direction", "")).upper()
                 stake = float(ot.get("stake", ot.get("stake_amount", 0.0)))
 
+            stake_tol = getattr(self.config.safety, "stake_verification_tolerance", 0.01) if hasattr(self.config, "safety") else 0.01
             if (
                 asset == expected_asset
                 and direction == expected_direction
-                and abs(stake - expected_stake) < 0.01
+                and abs(stake - expected_stake) <= stake_tol
             ):
                 return True
 
@@ -433,13 +540,11 @@ class TradeManager:
         if outcome.upper() == "WIN":
             profit = stake * payout
             new_balance = current_balance + stake + profit
-            self.breaker.record_win()
             msg = f"Trade {trade_id} WON: +${profit:,.2f} profit (balance: ${new_balance:,.2f})"
             if self.alerter:
                 self.alerter.send_alert(f"🏆 {msg}")
         else:
             new_balance = current_balance
-            self.breaker.record_loss(now=now_dt)
             msg = f"Trade {trade_id} LOST: -${stake:,.2f} (balance: ${new_balance:,.2f})"
             if self.alerter:
                 self.alerter.send_alert(f"📉 {msg}")

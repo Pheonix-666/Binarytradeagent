@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any, Literal, Optional
 
 import yaml
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 # ── Nested config models ──────────────────────────────────────────────
@@ -84,7 +84,6 @@ class StakeConfig(BaseModel):
     max_amount: Optional[float] = Field(default=1000.0)
     round_to: float = Field(gt=0, default=1.0)
     stake_scale: float = Field(gt=0, le=1.0, default=1.0)
-    max_asset_exposure_pct: Optional[float] = Field(default=None)
 
     @model_validator(mode="after")
     def _validate_ordering(self) -> "StakeConfig":
@@ -277,14 +276,16 @@ class SelectionConfig(BaseModel):
 class SafetyConfig(BaseModel):
     """Safety and circuit-breaker parameters."""
 
-    max_orders_per_10min: int = Field(ge=1)
+    model_config = ConfigDict(extra="forbid")
+
+    max_orders_per_window: int = Field(ge=1, default=6)
     stale_data_multiplier: float = Field(gt=0)
     max_consecutive_exec_errors: int = Field(ge=1)
     kill_file: str
-    max_open_trades_per_asset: Optional[int] = Field(default=None)
-    max_daily_trades: Optional[int] = Field(default=None)
-    max_consecutive_losses: Optional[int] = Field(default=None)
-    breaker_cooldown_seconds: Optional[int] = Field(default=None)
+    balance_tolerance: float = Field(ge=0, default=1.0)
+    rounding_tolerance: float = Field(ge=0, default=0.001)
+    stake_verification_tolerance: float = Field(ge=0, default=0.01)
+    rate_limit_window_minutes: int = Field(ge=1, default=10)
 
 
 class LLMConfig(BaseModel):

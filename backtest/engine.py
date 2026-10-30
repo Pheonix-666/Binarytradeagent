@@ -38,6 +38,8 @@ from decision.schema import SystemState
 from decision.service import DecisionService
 from patterns.library import PatternLibrary, get_pattern_library
 from risk.stake import compute_equity, stake_amount
+import safety.limits as safety_limits
+from safety.limits import AccountSnapshot, OrderRequest
 from selection.stats import compute_asset_stats, hour_risk
 from adaptive.champion import ChampionTracker
 from adaptive.contexts import ContextTracker
@@ -342,7 +344,7 @@ class BacktestEngine:
                 active_profile = champion_tracker.champion_name
                 step_cfg = effective_config(cfg, adaptive_state=adaptive_state, active_profile=active_profile)
             else:
-                adaptive_state = None
+                adaptive_state = AdaptiveState()  # explicit NORMAL when adaptive disabled
                 step_cfg = cfg
 
             stats_as_of = {}
@@ -458,6 +460,37 @@ class BacktestEngine:
                         )
                         if cand and decision.stake_amount:
                             stake = decision.stake_amount
+                            current_open_stakes = sum(ot.stake for ot in open_trades)
+                            equity = compute_equity(cash, current_open_stakes)
+
+                            # Validate via safety.limits.check_order (parity with live)
+                            llm_order_req = OrderRequest(
+                                asset=cand.asset,
+                                direction=cand.direction.value,
+                                expiry_minutes=expiry_minutes,
+                                stake=stake,
+                                max_stake_pct=decision.stake_pct,
+                                shadow_only=False,
+                            )
+                            llm_acc = AccountSnapshot(
+                                balance=cash,
+                                equity=equity,
+                                open_trades=[
+                                    {"asset": ot.asset, "direction": ot.direction.value, "stake": ot.stake}
+                                    for ot in open_trades
+                                ],
+                                asset_modes={cand.asset: "live_eligible"},
+                            )
+                            llm_check = safety_limits.check_order(
+                                order=llm_order_req,
+                                account=llm_acc,
+                                config=step_cfg,
+                                adaptive_state=adaptive_state,
+                            )
+                            if not llm_check.allowed:
+                                skip_counts["safety_blocked"] = skip_counts.get("safety_blocked", 0) + 1
+                                continue
+
                             entry_delay = timedelta(minutes=cfg.backtest.entry_delay_bars)
                             entry_time = cur_t + entry_delay
                             lookup = fast_lookup_by_asset.get(cand.asset)
@@ -530,17 +563,7 @@ class BacktestEngine:
 
                     cand = cands[0]
 
-                    # Check portfolio constraints
-                    # a) Opposite-direction block
-                    has_opposite = any(
-                        ot.asset == asset and ot.direction != cand.direction
-                        for ot in open_trades
-                    )
-                    if has_opposite:
-                        skip_counts["opposite_direction"] += 1
-                        continue
-
-                    # b) Stake sizing (recompute open stakes and equity per committed trade)
+                    # Sizing and Safety validation via check_order (parity with live)
                     current_open_stakes = sum(ot.stake for ot in open_trades)
                     equity = compute_equity(cash, current_open_stakes)
 
@@ -566,13 +589,41 @@ class BacktestEngine:
                         skip_counts["stake_below_min"] += 1
                         continue
 
-                    # c) Exposure cap (step_cfg.stake.total_cap_pct converted from percentage)
-                    total_cap_fraction = step_cfg.stake.total_cap_pct / 100.0
-                    if (current_open_stakes + stake) > (total_cap_fraction * equity):
-                        skip_counts["exposure_cap"] += 1
+                    order_req = OrderRequest(
+                        asset=cand.asset,
+                        direction=cand.direction.value,
+                        expiry_minutes=expiry_minutes,
+                        stake=stake,
+                        max_stake_pct=target_pct,
+                        shadow_only=False,
+                    )
+                    acc_snapshot = AccountSnapshot(
+                        balance=cash,
+                        equity=equity,
+                        open_trades=[
+                            {"asset": ot.asset, "direction": ot.direction.value, "stake": ot.stake}
+                            for ot in open_trades
+                        ],
+                        asset_modes={cand.asset: "live_eligible"},
+                    )
+                    order_check = safety_limits.check_order(
+                        order=order_req,
+                        account=acc_snapshot,
+                        config=step_cfg,
+                        adaptive_state=adaptive_state,
+                    )
+                    if not order_check.allowed:
+                        if "Opposite direction" in order_check.reason:
+                            skip_counts["opposite_direction"] += 1
+                        elif "exceeds total_cap_pct" in order_check.reason:
+                            skip_counts["exposure_cap"] += 1
+                        elif "min_pct" in order_check.reason or "minimum allowed amount" in order_check.reason:
+                            skip_counts["stake_below_min"] += 1
+                        else:
+                            skip_counts["safety_blocked"] = skip_counts.get("safety_blocked", 0) + 1
                         continue
 
-                    # d) Cash sufficiency
+                    # Cash sufficiency
                     if stake > cash:
                         skip_counts["insufficient_cash"] += 1
                         continue

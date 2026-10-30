@@ -97,6 +97,7 @@ def config() -> AppConfig:
     cfg.stake.max_amount = 1000.0
     cfg.stake.round_to = 1.0
     cfg.mode = "paper"
+    cfg.adaptive.enabled = False
     return cfg
 
 
@@ -406,6 +407,48 @@ def test_telegram_alerter_command_authorization_and_dispatch():
     }
     res = alerter.handle_incoming_update(auth_update)
     assert "System Status: NORMAL" in res
+
+
+def test_reset_breaker_works_and_is_chat_id_restricted(config, tmp_path):
+    """Explicit test: /reset_breaker resets tripped breaker and is restricted to authorized chat_id."""
+    from alerts.telegram import create_operator_command_handlers
+
+    state_mgr = StateManager(state_file=tmp_path / "state.json")
+    breaker = CircuitBreaker(config=config)
+    ks = KillSwitch(workspace_root=tmp_path)
+    breaker.trip("Verification failed: lost order")
+    assert breaker.is_tripped() is True
+
+    handlers = create_operator_command_handlers(
+        state_manager=state_mgr,
+        breaker=breaker,
+        kill_switch=ks,
+        config=config,
+    )
+    alerter = TelegramAlerter(token="test_token", chat_id="123456789")
+    for cmd, h in handlers.items():
+        alerter.register_command(cmd, h)
+
+    # 1. Unauthorized chat_id attempts /reset_breaker -> Ignored, breaker remains tripped
+    unauth_update = {
+        "message": {
+            "chat": {"id": "999999999"},
+            "text": "/reset_breaker",
+        }
+    }
+    assert alerter.handle_incoming_update(unauth_update) is None
+    assert breaker.is_tripped() is True
+
+    # 2. Authorized chat_id issues /reset_breaker -> Reset executed, breaker restored
+    auth_update = {
+        "message": {
+            "chat": {"id": "123456789"},
+            "text": "/reset_breaker",
+        }
+    }
+    res = alerter.handle_incoming_update(auth_update)
+    assert "Breaker reset" in res
+    assert breaker.is_tripped() is False
 
 
 # ── 5. Specific Recovery and Safety Edge Tests ─────────────────────────────

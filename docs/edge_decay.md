@@ -33,3 +33,4 @@ $$N \approx \left\lceil \frac{z^2 \cdot p_1 (1 - p_1)}{\delta^2} \right\rceil$$
    - A $12$-point edge collapse triggers `CAUTION` in approximately $17$ trades.
 2. **Defensive Persistence**:
    - `DEFENSIVE` requires edge decay to hold across $2$ consecutive non-overlapping windows of $100$ trades ($200$ trades total) at $z=1.96$, preventing premature over-reaction to short-term variance while catching structural regime shifts.
+

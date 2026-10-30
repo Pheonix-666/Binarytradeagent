@@ -166,8 +166,8 @@ def create_operator_command_handlers(
         )
 
     def stop_handler(args: list[str]) -> str:
-        kill_switch.set_telegram_stop(True)
-        return "🛑 STOPPED: Emergency kill switch activated via Telegram. New orders halted."
+        kill_switch.activate_file()
+        return "🛑 STOPPED: KILL file created on machine. Emergency stop latched. New orders halted. Can only be cleared by deleting the KILL file on the machine."
 
     def resume_handler(args: list[str]) -> str:
         # Check if adaptive is PAUSED
@@ -175,29 +175,29 @@ def create_operator_command_handlers(
         if adaptive_controller and hasattr(adaptive_controller, "state"):
             current_tier = adaptive_controller.state.tier
 
-        if current_tier == "PAUSED":
-            # Check requalification requirements
-            req_cfg = getattr(config.adaptive, "requalification", None) if config else None
-            min_shadow = getattr(req_cfg, "min_shadow_trades", 30) if req_cfg else 30
-            shadow_count = getattr(adaptive_controller.state, "shadow_trades_count", 0)
-            shadow_wins = getattr(adaptive_controller.state, "shadow_wins", 0)
-            wr = shadow_wins / shadow_count if shadow_count > 0 else 0.0
-            payout = getattr(config.backtest, "default_payout", 0.85) if config else 0.85
-            be = 1.0 / (1.0 + payout)
+        if current_tier != "PAUSED":
+            return "ℹ️ System is not in PAUSED tier. /resume only leaves PAUSED after requalification."
 
-            if shadow_count < min_shadow or wr < be:
-                return (
-                    f"❌ /resume REFUSED: Requalification requirements not met.\n"
-                    f"Observed {shadow_count}/{min_shadow} shadow trades (win rate {wr:.1%}, break-even {be:.1%})."
-                )
-            # Requalification passed -> recover to DEFENSIVE
-            adaptive_controller.state.tier = "DEFENSIVE"
-            adaptive_controller.state.real_trading_allowed = True
-            adaptive_controller.state.in_rampup = True
-            adaptive_controller.state.rampup_trades_remaining = getattr(req_cfg, "rampup_trades", 20) if req_cfg else 20
+        # Check requalification requirements
+        req_cfg = getattr(config.adaptive, "requalification", None) if config else None
+        min_shadow = getattr(req_cfg, "min_shadow_trades", 30) if req_cfg else 30
+        shadow_count = getattr(adaptive_controller.state, "shadow_trades_count", 0)
+        shadow_wins = getattr(adaptive_controller.state, "shadow_wins", 0)
+        wr = shadow_wins / shadow_count if shadow_count > 0 else 0.0
+        payout = getattr(config.backtest, "default_payout", 0.85) if config else 0.85
+        be = 1.0 / (1.0 + payout)
 
-        kill_switch.set_telegram_stop(False)
-        return "▶️ RESUMED: Trading resumed. Kill switch cleared."
+        if shadow_count < min_shadow or wr < be:
+            return (
+                f"❌ /resume REFUSED: Requalification requirements not met.\n"
+                f"Observed {shadow_count}/{min_shadow} shadow trades (win rate {wr:.1%}, break-even {be:.1%})."
+            )
+        # Requalification passed -> recover to DEFENSIVE
+        adaptive_controller.state.tier = "DEFENSIVE"
+        adaptive_controller.state.real_trading_allowed = True
+        adaptive_controller.state.in_rampup = True
+        adaptive_controller.state.rampup_trades_remaining = getattr(req_cfg, "rampup_trades", 20) if req_cfg else 20
+        return "▶️ RESUMED: Requalification passed. Adaptive tier moved to DEFENSIVE in ramp-up mode."
 
     def reset_breaker_handler(args: list[str]) -> str:
         breaker.reset()

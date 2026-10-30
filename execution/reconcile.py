@@ -35,7 +35,7 @@ def reconcile_startup(
     saved_state: dict[str, Any],
     breaker: CircuitBreaker,
     alerter: Optional[Any] = None,
-    tolerance: float = 1.0,
+    tolerance: Optional[float] = None,
     now: Optional[datetime] = None,
 ) -> ReconcileResult:
     """Perform pre-trading reconciliation on system startup.
@@ -45,7 +45,7 @@ def reconcile_startup(
       saved_state: Persistent state dictionary from StateManager.load().
       breaker: System CircuitBreaker instance.
       alerter: Optional Telegram/system alerting facility.
-      tolerance: Allowable cash mismatch tolerance in dollars.
+      tolerance: Allowable cash mismatch tolerance in dollars (defaults to safety.balance_tolerance).
       now: Current UTC timestamp.
 
     Returns:
@@ -53,6 +53,13 @@ def reconcile_startup(
     """
     now_dt = now or datetime.now(timezone.utc)
     issues: list[str] = []
+    tol = (
+        tolerance
+        if tolerance is not None
+        else getattr(breaker.config.safety, "balance_tolerance", 1.0)
+        if hasattr(breaker, "config") and hasattr(breaker.config, "safety")
+        else 1.0
+    )
     unknown_trades: list[Any] = []
     resolved_pending: list[dict[str, Any]] = []
 
@@ -149,7 +156,7 @@ def reconcile_startup(
     balance_matched = breaker.check_balance_match(
         reported_balance=broker_balance,
         expected_balance=expected_balance,
-        tolerance=tolerance,
+        tolerance=tol,
         now=now_dt,
     )
     if not balance_matched:

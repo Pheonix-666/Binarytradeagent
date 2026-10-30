@@ -11,17 +11,23 @@ PROJECT_SPEC.md Section 8 (Safety Layer):
   - Daily loss limit enforcement.
   - Mode guard: live mode requires LIVE_CONFIRM=YES.
   - Zero hardcoded limits, pure function, no disk or network I/O.
+  - adaptive_state is a required parameter (no default). Real orders
+    must always supply an explicit state; None blocks the order.
+    Shadow/paper orders may pass None (treated as NORMAL).
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import logging
 import math
 import os
 from typing import Any, Optional, Sequence
 
 from adaptive.monitor import AdaptiveState
 from core.config import AppConfig
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -55,6 +61,8 @@ class OrderCheckResult:
 
     allowed: bool
     reason: str = "ok"
+    alert_required: bool = False
+    alert_text: str = ""
 
     def __bool__(self) -> bool:
         return self.allowed
@@ -65,16 +73,25 @@ def Allow() -> OrderCheckResult:
     return OrderCheckResult(allowed=True, reason="ok")
 
 
-def Block(reason: str) -> OrderCheckResult:
+def Block(
+    reason: str,
+    alert_required: bool = False,
+    alert_text: str = "",
+) -> OrderCheckResult:
     """Convenience factory for blocked check."""
-    return OrderCheckResult(allowed=False, reason=reason)
+    return OrderCheckResult(
+        allowed=False,
+        reason=reason,
+        alert_required=alert_required,
+        alert_text=alert_text,
+    )
 
 
 def check_order(
     order: Any,
     account: Any,
     config: AppConfig,
-    adaptive_state: Optional[AdaptiveState] = None,
+    adaptive_state: Optional[AdaptiveState],
 ) -> OrderCheckResult:
     """Pure validation check for an order against all safety rules.
 
@@ -82,10 +99,17 @@ def check_order(
       order: OrderRequest or object with asset, direction, expiry_minutes, stake.
       account: AccountSnapshot or object with balance, equity, open_trades, asset_modes.
       config: System AppConfig with safety, stake, and trading configurations.
-      adaptive_state: Runtime AdaptiveState from adaptive regulator (if active).
+      adaptive_state: REQUIRED — no default; callers must always pass explicitly.
+          For REAL orders: supply the current AdaptiveState.  Passing None for a
+          real order immediately returns Block("adaptive state missing").
+          For SHADOW/PAPER orders: None is accepted and treated as NORMAL
+          (stake_scale=1.0, real_trading_allowed=True).
+          When adaptive is DISABLED in config: pass AdaptiveState() which uses
+          the safe NORMAL defaults (tier="NORMAL", real_trading_allowed=True,
+          stake_scale=1.0).
 
     Returns:
-      OrderCheckResult: Allow() or Block(reason).
+      OrderCheckResult: Allow() or Block(reason, alert_required, alert_text).
     """
     asset = getattr(order, "asset", "")
     direction = str(getattr(order, "direction", "")).upper()
@@ -111,11 +135,18 @@ def check_order(
 
     # 2. Real Trading Allowed by Adaptive Regulator
     if not shadow_only:
-        if adaptive_state is not None:
-            if not adaptive_state.real_trading_allowed or adaptive_state.tier == "PAUSED":
-                return Block(
-                    f"Real trading currently halted by adaptive regulator (tier={adaptive_state.tier})"
-                )
+        # Real orders require an explicit adaptive state — None is a programming error.
+        if adaptive_state is None:
+            return Block(
+                "adaptive state missing: real orders require an explicit AdaptiveState "
+                "(pass AdaptiveState() when adaptive is disabled)",
+                alert_required=True,
+                alert_text="🚨 check_order called for a real order without adaptive state",
+            )
+        if not adaptive_state.real_trading_allowed or adaptive_state.tier == "PAUSED":
+            return Block(
+                f"Real trading currently halted by adaptive regulator (tier={adaptive_state.tier})"
+            )
 
     # 3. Asset Mode Check
     if not shadow_only:
@@ -131,47 +162,27 @@ def check_order(
             f"Expiry {expiry_minutes}m not in allowed_expiries {config.trading.allowed_expiries}"
         )
 
-    # 5. No Opposite Trades on Same Asset
+    # 5. No Opposite Trades on Same Asset / Unknown Direction Fail Closed
     for ot in open_trades:
         ot_asset = getattr(ot, "asset", "")
         if isinstance(ot, dict):
             ot_asset = ot.get("asset", "")
         if ot_asset == asset:
-            ot_dir = str(getattr(ot, "direction", getattr(ot, "get", lambda k: "")("direction"))).upper()
-            if ot_dir and ot_dir != direction:
-                return Block(
-                    f"Opposite direction trade already open on {asset} ({ot_dir} vs {direction})"
-                )
-
-    # 5b. Per-Asset Exposure and Open Trades Limit
-    max_open_per_asset = getattr(config.safety, "max_open_trades_per_asset", None) or getattr(config.trading, "max_trades_per_asset", None)
-    max_asset_exp_pct = getattr(config.stake, "max_asset_exposure_pct", None)
-    asset_stakes = 0.0
-    asset_count = 0
-    for ot in open_trades:
-        ot_asset = ot.get("asset", "") if isinstance(ot, dict) else getattr(ot, "asset", "")
-        if ot_asset == asset:
-            asset_count += 1
-            stk = ot.get("stake", ot.get("stake_amount", 0.0)) if isinstance(ot, dict) else getattr(ot, "stake", getattr(ot, "stake_amount", 0.0))
-            asset_stakes += float(stk)
-
-    if max_open_per_asset is not None and (asset_count + 1) > max_open_per_asset:
-        return Block(f"Per-asset trade limit reached for {asset}: {asset_count + 1} > maximum {max_open_per_asset}")
-
-    if max_asset_exp_pct is not None:
-        asset_exp = ((asset_stakes + stake) / equity) * 100.0
-        if asset_exp > max_asset_exp_pct + 1e-6:
-            return Block(
-                f"Per-asset exposure {asset_exp:.2f}% on {asset} exceeds limit {max_asset_exp_pct}%"
-            )
-
-    # 5c. Max Daily Trades Limit
-    max_daily_trades = getattr(config.safety, "max_daily_trades", None) or getattr(config.trading, "max_daily_trades", None)
-    today_trades = getattr(account, "today_trades", None)
-    if max_daily_trades is not None and today_trades is not None and today_trades >= max_daily_trades:
-        return Block(
-            f"Daily trade count limit reached: {today_trades} >= maximum {max_daily_trades}"
-        )
+            raw_dir = ot.get("direction") if isinstance(ot, dict) else getattr(ot, "direction", None)
+            ot_dir = str(raw_dir).upper() if raw_dir is not None else ""
+            if ot_dir in ("CALL", "PUT"):
+                if ot_dir != direction:
+                    return Block(
+                        f"Opposite direction trade already open on {asset} ({ot_dir} vs {direction})"
+                    )
+            else:
+                # Open trade on same asset has missing or unparseable direction -> fail closed for real orders
+                if not shadow_only:
+                    return Block(
+                        f"open trade with unknown direction on {asset}",
+                        alert_required=True,
+                        alert_text=f"🚨 Open trade with unknown direction on {asset}",
+                    )
 
     # 6. Absolute Stake Limits
     min_amount = config.stake.min_amount
@@ -184,9 +195,10 @@ def check_order(
 
     # 7. Rounding Check
     round_to = config.stake.round_to
+    round_tol = getattr(config.safety, "rounding_tolerance", 0.001) if hasattr(config, "safety") else 0.001
     if round_to > 0:
         floored = math.floor(stake / round_to + 1e-9) * round_to
-        if abs(stake - floored) > 0.001:
+        if abs(stake - floored) > round_tol:
             return Block(
                 f"Stake {stake} is not floored to round_to {round_to} (expected {floored})"
             )

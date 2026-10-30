@@ -799,4 +799,42 @@ def test_missing_entry_bar_data_gap_skip(base_config):
     assert "data_gap_exit" in res.skip_counts
 
 
+def test_backtest_engine_blocks_order_blocked_by_check_order(base_config, monkeypatch):
+    """Backtest engine parity: orders blocked by safety.limits.check_order are blocked in backtest."""
+    from safety import limits
+    from safety.limits import Block
+
+    cfg = base_config.model_copy(deep=True)
+    for tf in [cfg.gate.trend.daily, cfg.gate.trend.h1, cfg.gate.trend.m15]:
+        tf.ema_fast = 3
+        tf.ema_slow = 6
+        tf.adx_period = 3
+        tf.adx_min = 0.0
+        tf.warmup_multiplier = 1
+    cfg.patterns.min_similarity = 35.0
+    cal = CalendarConfig(type="always_open", daily_boundary_tz="UTC", daily_boundary_hour=0)
+    start_dt = datetime(2026, 8, 1, 0, 0, 0, tzinfo=timezone.utc)
+    # Plant strong edge to ensure candidate generation
+    df = generate_synthetic_candles("EURUSD", start_dt=start_dt, days=10, calendar=cal, seed=42, planted_edge="CALL")
+    p_data = precompute_asset_data("EURUSD", df, cal, cfg)
+
+    # 1. Normal run with check_order allowing compliant orders: trades are executed
+    engine = BacktestEngine(config=cfg, data_by_asset={"EURUSD": p_data})
+    res_normal = engine.run(start_t=start_dt + timedelta(days=7), end_t=start_dt + timedelta(days=9), expiry_minutes=30)
+    normal_trades_count = len(res_normal.trades)
+    assert normal_trades_count > 0, "Normal backtest must generate at least 1 trade with planted edge"
+
+    # 2. Monkeypatch safety.limits.check_order to block every order
+    def _mock_check_order(*args, **kwargs):
+        return Block("Custom safety violation: order blocked by check_order")
+
+    monkeypatch.setattr(limits, "check_order", _mock_check_order)
+
+    # 3. Re-run backtest: engine must call check_order, block every order, and execute 0 trades
+    engine_blocked = BacktestEngine(config=cfg, data_by_asset={"EURUSD": p_data})
+    res_blocked = engine_blocked.run(start_t=start_dt + timedelta(days=7), end_t=start_dt + timedelta(days=9), expiry_minutes=30)
+    assert len(res_blocked.trades) == 0
+    assert res_blocked.skip_counts.get("safety_blocked", 0) > 0
+
+
 

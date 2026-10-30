@@ -133,10 +133,14 @@ selection:
   ranking_modes: ["paper", "demo", "live"]
 
 safety:
-  max_orders_per_10min: 6
+  max_orders_per_window: 6
   stale_data_multiplier: 2
   max_consecutive_exec_errors: 3
   kill_file: KILL
+  balance_tolerance: 1.0
+  rounding_tolerance: 0.001
+  stake_verification_tolerance: 0.01
+  rate_limit_window_minutes: 10
 
 llm:
   provider: anthropic
