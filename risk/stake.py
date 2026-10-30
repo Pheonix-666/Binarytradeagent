@@ -50,13 +50,14 @@ def stake_amount(
     pct: float,
     min_amount: float = 1.0,
     round_to: float = 1.0,
+    max_amount: Optional[float] = None,
 ) -> Optional[float]:
     """Calculate position stake amount from equity and percentage.
 
     Rules:
-      - Raw cap amount = equity * (pct / 100).
+      - Raw cap amount = equity * (pct / 100), capped at max_amount if configured.
       - Round DOWN to nearest round_to (floor), so the rounded stake never exceeds
-        the percentage cap.
+        the percentage cap or platform maximum.
       - If the floored amount is below min_amount, return None (SKIP) rather
         than rounding up.
     """
@@ -64,6 +65,8 @@ def stake_amount(
         return None
 
     raw_cap = equity * (pct / 100.0)
+    if max_amount is not None and max_amount > 0:
+        raw_cap = min(raw_cap, float(max_amount))
 
     if round_to > 0:
         # Determine decimal precision to avoid binary floating point representation artifacts
@@ -78,6 +81,9 @@ def stake_amount(
             floored = round((steps - 1) * round_to, decimals)
     else:
         floored = round(raw_cap, 2)
+
+    if max_amount is not None and max_amount > 0:
+        floored = min(floored, float(max_amount))
 
     # If the floored amount is below min_amount, return None (SKIP)
     if floored < (min_amount - 1e-9):

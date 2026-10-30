@@ -148,11 +148,19 @@ def validate_decision(
                 raw_decision=decision_out,
             )
 
-        if stake_pct > (matched_cand.max_stake_pct + 1e-4):
+        # Tier-scaled maximum stake percentage check
+        stake_scale = 1.0
+        if report.adaptive_state is not None:
+            stake_scale = float(report.adaptive_state.stake_scale)
+        elif getattr(state, "adaptive_state", None) is not None:
+            stake_scale = float(getattr(state.adaptive_state, "stake_scale", 1.0))
+
+        tier_scaled_max = round(matched_cand.max_stake_pct * stake_scale, 2)
+        if stake_pct > (tier_scaled_max + 1e-4):
             return ValidatedDecision(
                 decision="SKIP",
                 is_valid=False,
-                skip_reason=f"stake_above_max_pct: {stake_pct} > max {matched_cand.max_stake_pct}",
+                skip_reason=f"stake_above_max_pct: {stake_pct} > tier-scaled max {tier_scaled_max} (scale={stake_scale})",
                 checks_passed=passed_checks,
                 raw_decision=decision_out,
             )
@@ -164,6 +172,7 @@ def validate_decision(
             pct=stake_pct,
             min_amount=config.stake.min_amount,
             round_to=config.stake.round_to,
+            max_amount=config.stake.max_amount,
         )
 
         if computed_stake is None:

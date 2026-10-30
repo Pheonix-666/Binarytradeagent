@@ -123,6 +123,9 @@ stake:
   max_pct: 20
   total_cap_pct: 35
   daily_loss_limit_pct: null   # null = off
+  min_amount: 1.0
+  max_amount: 1000.0           # platform maximum single trade stake cap
+  round_to: 1.0
 
 gate:
   strict_trend_gate: true
@@ -256,7 +259,7 @@ Each input becomes a 0-100 **risk sub-score** (higher = riskier). The final risk
 max_stake_pct = 20 - (risk - 1) / 99 * 19      # risk 1 -> 20%, risk 50 -> 10.60%, risk 100 -> 1%
 ```
 
-(use `stake.max_pct` and `stake.min_pct` from config in place of 20 and 1). The LLM may choose any stake between `min_pct` and `max_pct_for_this_risk`, never above. Total open stakes may never exceed `total_cap_pct` of the balance.
+(use `stake.max_pct` and `stake.min_pct` from config in place of 20 and 1). The LLM may choose any stake between `min_pct` and `max_pct_for_this_risk`, never above. Total open stakes may never exceed `total_cap_pct` of the balance. Position amounts are floored to `stake.round_to`, capped at platform `stake.max_amount`, and skipped if below `stake.min_amount`.
 
 ### 6.6 Pattern library (`patterns/`)
 
@@ -420,6 +423,27 @@ Never retry an order automatically. After a result, update asset stats and the s
 - **Split:** choose rules on the first `train_fraction` of the data, then report results on the remaining data the rules never saw. Walk-forward if enough data.
 - **Report:** trades, win rate with 95% CI, break-even rate, EV per trade, equity curve under the stake rules, max drawdown, and breakdowns by asset, pattern, session, and risk bucket.
 - For OTC assets, backtest only on the platform's own recorded candles after enough recording time.
+
+---
+
+## 11.5. Adaptive layer (`adaptive/`)
+
+A pure regulatory layer that dynamically adjusts system aggressiveness based on real-time performance telemetry.
+
+### Core Principles
+1. **Tightening Only:** The adaptive layer may ONLY tighten risk, switch to pre-approved profiles, or pause. It never increases a stake after a loss, never loosens a threshold relative to the base configuration, and never touches hard safety limits (stake 1–20%, total open exposure 35%).
+2. **Dual Speed Dynamics:**
+   - **Fast Reactions (size reduction & pausing):** Triggered immediately by peak drawdown and consecutive loss streaks.
+   - **Slow Reactions (profile switching & context suspension):** Require statistically significant evidence and mandatory cooldown periods. No adaptation is performed on fewer trades than configured sample minimums.
+3. **Pure Logic & Determinism:** Explicit inputs (`equity`, `closed_trades`, `now`, `prev_state`) and outputs, ensuring identical execution in backtesting and live operations without disk or network I/O inside decision loops.
+4. **Serialization:** `AdaptiveController` and `AdaptiveState` implement `to_dict()` and `from_dict()`.
+
+### Modules
+- **`adaptive/monitor.py`:** State machine operating across four tiers: `NORMAL` $\to$ `CAUTION` $\to$ `DEFENSIVE` $\to$ `PAUSED`. Escalation is immediate upon breaching drawdown or streak thresholds. Recovery moves down strictly ONE tier at a time with a configured hysteresis fraction. `PAUSED` persists until requalification passes ($\ge 30$ shadow trades beating break-even), followed by a 20-trade ramp-up at half stakes.
+- **`adaptive/profiles.py`:** Pre-approved profile overrides limited to a strict whitelist of keys with a clear monotonic tightening order: `reversal_mode` (can only tighten to "off"), `patterns.min_similarity` (can only increase), `max_risk_cap` (can only decrease), and `stake_scale` (can only decrease $\le 1.0$). Shipped profiles: `standard` and `conservative`. Computes `effective_config` guaranteeing every parameter is at least as strict as the base config, and hard safety limits (stake 1–20%, total cap 35%, max_amount) are strictly untouched.
+- **`adaptive/champion.py`:** Champion-challenger shadow tracker. Expensive per-step operations (indicators, trend detection, DTW pattern matching) are computed once and shared; each profile applies its filters post-hoc. The live champion switches only when a challenger achieves $\ge 50$ shadow trades, Wilson 95% CI lower bound $>$ break-even, $\ge 0.02$ EV advantage, and cooldown $\ge 3$ days.
+- **`adaptive/contexts.py`:** Tags every trade across dimensions `[asset, hour_bucket, pattern, risk_bucket, volatility_bucket, expiry]`. Calculates Wilson 99% CI upper bound ($z=2.58$). If $n \ge 30$ and upper bound $<$ break-even, the context is suspended (capped at at most 30% of observed contexts). Candidates matching suspended contexts are skipped with explicit reasons.
+- **`adaptive/postmortem.py`:** Diagnostic Markdown generator analyzing recent losses, tier transitions, and context health. Never mutates state or config.
 
 ---
 

@@ -578,6 +578,33 @@ def test_report_determinism(config, sample_candidate):
     assert rep1.candidates[1].asset == "EURUSD"
 
 
+def test_validator_rejects_stake_above_tier_scaled_max(config, sample_report, valid_decision_dict):
+    """Validator rejects stake above tier-scaled maximum when adaptive regulator scales stake."""
+    from decision.schema import AdaptiveReportItem
+
+    now = datetime(2026, 10, 30, 10, 0, 5, tzinfo=timezone.utc)
+    state = SystemState()
+    d = dict(valid_decision_dict)
+    # candidate max_stake_pct is 13.4%
+    # With stake_scale = 0.5 (CAUTION tier), tier-scaled max is 13.4 * 0.5 = 6.7%
+    d["stake_pct"] = 8.0  # 8.0% is below 13.4% unscaled, but above 6.7% tier-scaled!
+
+    report_scaled = sample_report.model_copy(deep=True)
+    report_scaled.adaptive_state = AdaptiveReportItem(
+        tier="CAUTION",
+        stake_scale=0.5,
+        min_similarity_add=5.0,
+        max_risk_cap=50.0,
+        real_trading_allowed=True,
+    )
+
+    res = validate_decision(d, report_scaled, state, config, now)
+    assert res.decision == "SKIP"
+    assert res.is_valid is False
+    assert "stake_above_max_pct" in res.skip_reason
+    assert "scale=0.5" in res.skip_reason
+
+
 # ── 5. Optional Live LLM Integration Test ───────────────────────────────
 
 

@@ -81,7 +81,10 @@ class StakeConfig(BaseModel):
     total_cap_pct: float = Field(gt=0, le=100)
     daily_loss_limit_pct: Optional[float] = Field(default=None)
     min_amount: float = Field(gt=0, default=1.0)
+    max_amount: Optional[float] = Field(default=1000.0)
     round_to: float = Field(gt=0, default=1.0)
+    stake_scale: float = Field(gt=0, le=1.0, default=1.0)
+    max_asset_exposure_pct: Optional[float] = Field(default=None)
 
     @model_validator(mode="after")
     def _validate_ordering(self) -> "StakeConfig":
@@ -92,6 +95,10 @@ class StakeConfig(BaseModel):
         if self.max_pct > self.total_cap_pct:
             raise ValueError(
                 f"max_pct={self.max_pct} must be <= total_cap_pct={self.total_cap_pct}"
+            )
+        if self.max_amount is not None and self.max_amount < self.min_amount:
+            raise ValueError(
+                f"max_amount={self.max_amount} must be >= min_amount={self.min_amount}"
             )
         if self.daily_loss_limit_pct is not None:
             if self.daily_loss_limit_pct <= 0 or self.daily_loss_limit_pct > 100:
@@ -237,6 +244,7 @@ class RiskConfig(BaseModel):
     sr_distance_max_atr: float = Field(gt=0, default=3.0)
     sr_distance_near_score: float = Field(ge=0, le=100, default=90.0)
     sr_distance_far_score: float = Field(ge=0, le=100, default=10.0)
+    max_risk_cap: Optional[float] = Field(default=None)
 
     @model_validator(mode="after")
     def _validate_sr_distance_order(self) -> "RiskConfig":
@@ -273,6 +281,10 @@ class SafetyConfig(BaseModel):
     stale_data_multiplier: float = Field(gt=0)
     max_consecutive_exec_errors: int = Field(ge=1)
     kill_file: str
+    max_open_trades_per_asset: Optional[int] = Field(default=None)
+    max_daily_trades: Optional[int] = Field(default=None)
+    max_consecutive_losses: Optional[int] = Field(default=None)
+    breaker_cooldown_seconds: Optional[int] = Field(default=None)
 
 
 class LLMConfig(BaseModel):
@@ -312,6 +324,148 @@ class BacktestConfig(BaseModel):
     max_llm_steps: int = Field(ge=1, default=200)
 
 
+# ── Adaptive layer config ─────────────────────────────────────────────
+
+
+class AdaptiveTierCaution(BaseModel):
+    drawdown_pct: float = Field(gt=0, le=100, default=15.0)
+    consecutive_losses: int = Field(ge=1, default=4)
+    stake_scale: float = Field(gt=0, le=1.0, default=0.5)
+    min_similarity_add: float = Field(ge=0, default=5.0)
+    max_risk_cap: float = Field(gt=0, le=100, default=50.0)
+
+
+class AdaptiveTierDefensive(BaseModel):
+    drawdown_pct: float = Field(gt=0, le=100, default=25.0)
+    consecutive_losses: Optional[int] = Field(default=None)
+    stake_scale: float = Field(gt=0, le=1.0, default=0.35)
+    reversal_mode: str = Field(default="off")
+    min_similarity_add: float = Field(ge=0, default=10.0)
+    max_risk_cap: float = Field(gt=0, le=100, default=40.0)
+
+    @field_validator("reversal_mode", mode="before")
+    @classmethod
+    def _coerce_reversal_mode(cls, v: Any) -> str:
+        if isinstance(v, bool):
+            return "off" if not v else "on"
+        return str(v)
+
+
+class AdaptiveTierPaused(BaseModel):
+    drawdown_pct: float = Field(gt=0, le=100, default=40.0)
+    real_trading: bool = Field(default=False)
+
+
+class AdaptiveTiersConfig(BaseModel):
+    caution: AdaptiveTierCaution = Field(default_factory=AdaptiveTierCaution)
+    defensive: AdaptiveTierDefensive = Field(default_factory=AdaptiveTierDefensive)
+    paused: AdaptiveTierPaused = Field(default_factory=AdaptiveTierPaused)
+
+    @model_validator(mode="after")
+    def _validate_tier_drawdown_ordering(self) -> "AdaptiveTiersConfig":
+        if not (self.caution.drawdown_pct < self.defensive.drawdown_pct < self.paused.drawdown_pct):
+            raise ValueError(
+                f"Adaptive tier drawdown thresholds must be strictly increasing: "
+                f"caution ({self.caution.drawdown_pct}) < defensive ({self.defensive.drawdown_pct}) < paused ({self.paused.drawdown_pct})"
+            )
+        return self
+
+
+class RequalificationConfig(BaseModel):
+    min_shadow_trades: int = Field(ge=1, default=30)
+    win_rate_margin: float = Field(ge=0, default=0.0)
+    rampup_trades: int = Field(ge=1, default=20)
+    rampup_stake_scale: float = Field(gt=0, le=1.0, default=0.5)
+
+
+class ProfileSwitchConfig(BaseModel):
+    min_shadow_trades: int = Field(ge=1, default=50)
+    require_ci_lower_above_break_even: bool = Field(default=True)
+    min_ev_advantage: float = Field(ge=0, default=0.02)
+    cooldown_days: float = Field(ge=0, default=3.0)
+
+
+class EdgeDecayConfig(BaseModel):
+    """Edge decay detection parameters."""
+
+    window_trades_caution: int = Field(ge=1, default=60)
+    z_caution: float = Field(gt=0, default=1.0)
+    window_trades: int = Field(ge=1, default=100)
+    min_trades: int = Field(ge=1, default=30)
+    z: float = Field(gt=0, default=1.96)
+    tier_on_decay: Literal["caution", "defensive", "paused"] = "caution"
+    tier_on_persistent: Literal["caution", "defensive", "paused"] = "defensive"
+    persist_windows: int = Field(ge=1, default=2)
+
+    @field_validator("tier_on_decay", "tier_on_persistent", mode="before")
+    @classmethod
+    def _normalize_tier(cls, v: Any) -> str:
+        return str(v).lower()
+
+
+class ContextLearningConfig(BaseModel):
+    min_trades: int = Field(ge=1, default=30)
+    z: float = Field(gt=0, default=2.58)
+    cooldown_days: float = Field(ge=0, default=3.0)
+    max_suspended_fraction: float = Field(gt=0, le=1.0, default=0.3)
+    keys: list[str] = Field(
+        default_factory=lambda: [
+            "asset",
+            "hour_bucket",
+            "pattern",
+            "risk_bucket",
+            "volatility_bucket",
+            "expiry",
+        ]
+    )
+
+
+PROFILE_WHITELIST_KEYS: set[str] = {
+    "reversal_mode",
+    "patterns.min_similarity",
+    "min_similarity",
+    "max_risk_cap",
+    "stake_scale",
+}
+
+
+class AdaptiveConfig(BaseModel):
+    enabled: bool = Field(default=True)
+    reference: Literal["peak", "session_start", "checkpoint"] = "peak"
+    tiers: AdaptiveTiersConfig = Field(default_factory=AdaptiveTiersConfig)
+    hysteresis_recovery_fraction: float = Field(gt=0, lt=1.0, default=0.5)
+    requalification: RequalificationConfig = Field(default_factory=RequalificationConfig)
+    profiles: dict[str, dict[str, Any]] = Field(
+        default_factory=lambda: {
+            "standard": {},
+            "conservative": {
+                "patterns.min_similarity": 85.0,
+                "max_risk_cap": 45,
+                "stake_scale": 0.8,
+            },
+        }
+    )
+    profile_switch: ProfileSwitchConfig = Field(default_factory=ProfileSwitchConfig)
+    context_learning: ContextLearningConfig = Field(default_factory=ContextLearningConfig)
+    edge_decay: EdgeDecayConfig = Field(default_factory=EdgeDecayConfig)
+
+    @field_validator("profiles")
+    @classmethod
+    def _validate_profile_keys(cls, v: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
+        for pname, pdict in v.items():
+            if not isinstance(pdict, dict):
+                raise ValueError(f"Profile '{pname}' must be a dictionary")
+            for k in list(pdict.keys()):
+                if k not in PROFILE_WHITELIST_KEYS:
+                    raise ValueError(
+                        f"Profile '{pname}' contains forbidden key '{k}'. "
+                        f"Allowed whitelist: {sorted(list(PROFILE_WHITELIST_KEYS))}"
+                    )
+                if k == "reversal_mode" and isinstance(pdict[k], bool):
+                    pdict[k] = "off" if not pdict[k] else "on"
+        return v
+
+
 # ── Root config ───────────────────────────────────────────────────────
 
 
@@ -334,6 +488,7 @@ class AppConfig(BaseModel):
     llm: LLMConfig
     alerts: AlertsConfig
     backtest: BacktestConfig
+    adaptive: AdaptiveConfig = Field(default_factory=AdaptiveConfig)
 
 
 # ── Loader ────────────────────────────────────────────────────────────

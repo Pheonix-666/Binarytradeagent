@@ -51,14 +51,19 @@ class PrecomputedAssetData:
             if df.empty:
                 sliced[tf] = df
                 continue
+            if "ts_close" not in df.columns:
+                if tf == "1m":
+                    df = df.copy()
+                    df["ts_close"] = df["ts"] + timedelta(minutes=1)
+                else:
+                    raise ValueError(f"Missing required 'ts_close' column on timeframe '{tf}'")
             idx = self.ts_indices.get(tf)
             if idx is not None:
                 # searchsorted on sorted ts_close timestamps
                 pos = idx.searchsorted(t_utc, side="right")
                 sliced[tf] = df.iloc[:pos]
             else:
-                close_col = "ts_close" if "ts_close" in df.columns else "ts"
-                sliced[tf] = df[df[close_col] <= t_utc]
+                sliced[tf] = df[df["ts_close"] <= t_utc]
         return sliced
 
 
@@ -170,6 +175,14 @@ def precompute_asset_data(
         candles_by_tf[tf] = df
 
     # Build DatetimeIndex for fast binary searching (indexed by ts_close to prevent look-ahead)
+    # Strictly forbid missing ts_close on timeframes other than 1m
+    for tf, df in candles_by_tf.items():
+        if not df.empty and "ts_close" not in df.columns:
+            if tf == "1m":
+                df["ts_close"] = df["ts"] + timedelta(minutes=1)
+            else:
+                raise ValueError(f"Timeframe '{tf}' is missing required 'ts_close' column")
+
     ts_indices = {
         tf: pd.DatetimeIndex(df["ts_close"]) for tf, df in candles_by_tf.items() if not df.empty
     }

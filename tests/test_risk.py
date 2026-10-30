@@ -112,6 +112,18 @@ def test_stake_amount_rounding_and_skip():
     assert stake_amount(equity=100.0, pct=0.0) is None
 
 
+def test_stake_amount_max_amount_cap():
+    """Stake calculation caps position size at max_amount regardless of high equity."""
+    equity = 100000.0  # $100k equity
+    # 10% of 100k = $10,000, but max_amount = 500.0 -> capped at 500.0
+    amt = stake_amount(equity, pct=10.0, min_amount=1.0, round_to=1.0, max_amount=500.0)
+    assert amt == 500.0
+
+    # If raw cap < max_amount, raw cap is used
+    amt_small = stake_amount(equity=1000.0, pct=5.0, min_amount=1.0, round_to=1.0, max_amount=500.0)
+    assert amt_small == 50.0
+
+
 def test_stake_amount_property_never_exceeds_percentage_cap():
     """Property test: for many equities, pcts, and round_to values, stake_amount/equity <= pct."""
     equities = [50.0, 100.0, 250.0, 777.77, 1000.0, 5432.10, 10000.0]

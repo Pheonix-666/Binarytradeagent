@@ -31,7 +31,7 @@ def test_no_hardcoded_stake_limits_outside_config():
     rather than embedded as literals in operational logic.
     """
     project_root = Path(__file__).resolve().parent.parent
-    checked_packages = ["analysis", "decision", "risk", "backtest", "selection"]
+    checked_packages = ["analysis", "decision", "risk", "backtest", "selection", "adaptive"]
 
     # Patterns representing hardcoded stake limit values in active code (excluding comments)
     suspicious_patterns = [
@@ -189,3 +189,4 @@ def test_total_open_stakes_never_exceeds_total_cap_pct_property():
             assert exposure_pct <= total_cap_pct + 1e-7, (
                 f"Exposure pct {exposure_pct}% exceeded total_cap_pct {total_cap_pct}%"
             )
+

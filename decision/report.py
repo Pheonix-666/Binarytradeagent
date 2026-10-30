@@ -16,6 +16,7 @@ from typing import Any, Mapping, Optional, Sequence
 from analysis.candidates import CandidateTrade
 from core.config import AppConfig
 from decision.schema import (
+    AdaptiveReportItem,
     AssetStatsItem,
     CandidateReportItem,
     DecisionReport,
@@ -51,6 +52,7 @@ def build_report(
     now: datetime,
     asset_modes: Optional[Mapping[str, str]] = None,
     asset_stats_map: Optional[Mapping[str, Any]] = None,
+    adaptive_state: Optional[Any] = None,
 ) -> DecisionReport:
     """Turn CandidateTrade objects into the structured DecisionReport from Section 7.2.
 
@@ -159,6 +161,16 @@ def build_report(
     # Deterministic candidate ordering: sort by asset id, then direction
     report_candidates.sort(key=lambda c: (c.asset, c.direction))
 
+    ad_item = None
+    if adaptive_state is not None:
+        ad_item = AdaptiveReportItem(
+            tier=str(getattr(adaptive_state, "tier", "NORMAL")),
+            stake_scale=float(getattr(adaptive_state, "stake_scale", 1.0)),
+            min_similarity_add=float(getattr(adaptive_state, "min_similarity_add", 0.0)),
+            max_risk_cap=float(getattr(adaptive_state, "max_risk_cap")) if getattr(adaptive_state, "max_risk_cap", None) is not None else None,
+            real_trading_allowed=bool(getattr(adaptive_state, "real_trading_allowed", True)),
+        )
+
     return DecisionReport(
         timestamp=now_utc.isoformat(),
         balance=round(balance, 2),
@@ -167,5 +179,6 @@ def build_report(
         remaining_exposure_pct=remaining_exposure_pct,
         min_stake_pct=min_stake_pct,
         candidates=report_candidates,
+        adaptive_state=ad_item,
     )
 

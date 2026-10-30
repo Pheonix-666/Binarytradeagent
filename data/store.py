@@ -183,9 +183,11 @@ class DataStore:
         if "ts_close" in candles_df.columns:
             if not pd.api.types.is_datetime64_any_dtype(candles_df["ts_close"]):
                 candles_df["ts_close"] = pd.to_datetime(candles_df["ts_close"], utc=True)
-            ts_close_strings = candles_df["ts_close"].dt.strftime("%Y-%m-%dT%H:%M:%SZ")
         else:
-            ts_close_strings = [None] * len(candles_df)
+            from data.candle_builder import TIMEFRAME_DELTAS
+            delta = TIMEFRAME_DELTAS.get(timeframe, timedelta(minutes=1))
+            candles_df["ts_close"] = candles_df["ts"] + delta
+        ts_close_strings = candles_df["ts_close"].dt.strftime("%Y-%m-%dT%H:%M:%SZ")
 
         if "volume" not in candles_df.columns:
             volume_series = 0.0

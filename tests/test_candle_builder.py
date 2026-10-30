@@ -411,3 +411,51 @@ def test_no_partial_sunday_candle():
     assert exp == 1440
 
 
+def test_resampled_bars_ts_close_is_bucket_end():
+    """Verify that resample_candles sets ts_close = bucket end exactly for every timeframe (5m, 15m, 1h, 1d)."""
+    from core.config import CalendarConfig
+    from data.calendar import get_daily_bucket_end
+
+    cal = CalendarConfig(type="always_open", daily_boundary_tz="UTC", daily_boundary_hour=0)
+    base = datetime(2026, 10, 1, 0, 0, 0, tzinfo=timezone.utc)
+
+    # 3 days of 1-minute bars
+    rows = []
+    for m in range(3 * 1440):
+        t = base + timedelta(minutes=m)
+        rows.append({
+            "ts": t,
+            "ts_close": t + timedelta(minutes=1),
+            "open": 1.1000,
+            "high": 1.1010,
+            "low": 1.0990,
+            "close": 1.1005,
+            "volume": 10.0,
+        })
+    df_1m = pd.DataFrame(rows)
+
+    expected_deltas = {
+        "5m": timedelta(minutes=5),
+        "15m": timedelta(minutes=15),
+        "1h": timedelta(hours=1),
+        "1d": timedelta(days=1),
+    }
+
+    for tf, delta in expected_deltas.items():
+        res = resample_candles(df_1m, target_timeframe=tf, calendar=cal)
+        assert not res.empty, f"Resampling produced empty df for {tf}"
+        assert "ts_close" in res.columns, f"Missing ts_close column for {tf}"
+
+        for _, row in res.iterrows():
+            if tf == "1d":
+                expected_end = get_daily_bucket_end(row["ts"], cal)
+            else:
+                expected_end = row["ts"] + delta
+
+            assert row["ts_close"] == expected_end, (
+                f"Mismatch on {tf}: bar starting at {row['ts']} had ts_close={row['ts_close']}, "
+                f"expected bucket end {expected_end}"
+            )
+
+
+

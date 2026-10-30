@@ -48,6 +48,7 @@ stake:
   # NOTE: min_amount and round_to are placeholders that must be set to the platform's
   # real minimum trade amount and increment before running in demo or live mode.
   min_amount: 1.0
+  max_amount: 1000.0   # placeholder for platform maximum single trade stake
   round_to: 1.0
 
 gate:
@@ -164,3 +165,55 @@ backtest:
   tie_policy: "loss"              # refund | loss
   ignore_paper_gate: true
   max_llm_steps: 200
+
+adaptive:
+  enabled: true
+  reference: peak           # peak | session_start | checkpoint
+  tiers:
+    caution:
+      drawdown_pct: 15
+      consecutive_losses: 4
+      stake_scale: 0.5
+      min_similarity_add: 5
+      max_risk_cap: 50
+    defensive:
+      drawdown_pct: 25
+      stake_scale: 0.35
+      reversal_mode: "off"
+      min_similarity_add: 10
+      max_risk_cap: 40
+    paused:
+      drawdown_pct: 40
+      real_trading: false
+  hysteresis_recovery_fraction: 0.5
+  requalification:
+    min_shadow_trades: 30
+    win_rate_margin: 0.0
+    rampup_trades: 20
+    rampup_stake_scale: 0.5
+  profiles:
+    standard: {}
+    conservative:
+      patterns.min_similarity: 85.0
+      max_risk_cap: 45
+      stake_scale: 0.8
+  profile_switch:
+    min_shadow_trades: 50
+    require_ci_lower_above_break_even: true
+    min_ev_advantage: 0.02
+    cooldown_days: 3
+  context_learning:
+    min_trades: 30
+    z: 2.58
+    cooldown_days: 3
+    max_suspended_fraction: 0.3
+    keys: [asset, hour_bucket, pattern, risk_bucket, volatility_bucket, expiry]
+  edge_decay:
+    window_trades_caution: 60
+    z_caution: 1.0
+    window_trades: 100
+    min_trades: 30
+    z: 1.96
+    tier_on_decay: caution
+    tier_on_persistent: defensive
+    persist_windows: 2

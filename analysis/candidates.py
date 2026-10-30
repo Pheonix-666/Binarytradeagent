@@ -224,9 +224,15 @@ def build_candidates(
     # Evaluate each eligible direction
     for direction in eligible_directions:
         # Filter patterns matching direction and min_similarity
+        def _match_dir(pat_dir: str, trade_dir: TradeDirection) -> bool:
+            pd_lower = str(pat_dir).lower()
+            if trade_dir == TradeDirection.CALL:
+                return pd_lower in ("up", "call")
+            return pd_lower in ("down", "put")
+
         dir_patterns = [
             p for p in all_patterns
-            if p["direction"].upper() == direction.value.upper()
+            if _match_dir(p["direction"], direction)
             and p["similarity"] >= config.patterns.min_similarity
         ]
 

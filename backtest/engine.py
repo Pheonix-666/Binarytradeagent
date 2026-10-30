@@ -39,6 +39,10 @@ from decision.service import DecisionService
 from patterns.library import PatternLibrary, get_pattern_library
 from risk.stake import compute_equity, stake_amount
 from selection.stats import compute_asset_stats, hour_risk
+from adaptive.champion import ChampionTracker
+from adaptive.contexts import ContextTracker
+from adaptive.monitor import AdaptiveController, AdaptiveState
+from adaptive.profiles import effective_config
 
 logger = get_logger()
 
@@ -155,6 +159,11 @@ class BacktestResult:
     skip_counts: dict[str, int]
     total_steps: int
     variant_name: str = ""
+    adaptive_enabled: bool = False
+    adaptive_state: Optional[AdaptiveState] = None
+    time_in_tier: dict[str, int] = field(default_factory=dict)
+    profile_switches: int = 0
+    context_suspensions: int = 0
 
 
 class BacktestEngine:
@@ -188,11 +197,21 @@ class BacktestEngine:
         expiry_minutes: int = 30,
         reversal_mode: Optional[str] = None,
         variant_name: str = "default",
+        enable_adaptive: Optional[bool] = None,
     ) -> BacktestResult:
         """Run the simulation from start_t to end_t."""
         cfg = self.config.model_copy(deep=True)
         if reversal_mode is not None:
             cfg.gate.reversal_mode = reversal_mode  # type: ignore
+
+        if enable_adaptive is None:
+            enable_adaptive = getattr(cfg.adaptive, "enabled", False)
+
+        adaptive_ctrl = AdaptiveController(config=cfg) if enable_adaptive else None
+        champion_tracker = ChampionTracker(config=cfg) if enable_adaptive else None
+        context_tracker = ContextTracker(config=cfg) if enable_adaptive else None
+        time_in_tier: dict[str, int] = {"NORMAL": 0, "CAUTION": 0, "DEFENSIVE": 0, "PAUSED": 0}
+        profile_switches = 0
 
         check_interval = timedelta(minutes=cfg.trading.check_interval_minutes)
         cash = cfg.backtest.starting_balance
@@ -255,6 +274,43 @@ class BacktestEngine:
                     updated_record = self.repo.get_trade_by_id(ot.trade_id)
                     if updated_record:
                         settled_trades.append(updated_record)
+                        if enable_adaptive and context_tracker and champion_tracker:
+                            context_tracker.record_trade(
+                                asset=updated_record.asset,
+                                hour_utc=updated_record.hour_utc,
+                                pattern_name=updated_record.pattern_name,
+                                risk_score=float(updated_record.risk_score),
+                                volatility_pct=float(ot.evidence.get("volatility_percentile", 50.0)),
+                                expiry_minutes=updated_record.expiry_minutes,
+                                result=result,
+                                now=cur_t,
+                            )
+                            champion_tracker.record_shadow_result(
+                                profile_name=champion_tracker.champion_name,
+                                result=result,
+                                payout=ot.payout,
+                            )
+                            # Also record shadow profile performance for challenger profiles that qualified
+                            for p_name, p_overrides in cfg.adaptive.profiles.items():
+                                if p_name == champion_tracker.champion_name:
+                                    continue
+                                min_sim = p_overrides.get("patterns.min_similarity", p_overrides.get("min_similarity"))
+                                max_risk = p_overrides.get("max_risk_cap")
+                                rev_mode = p_overrides.get("reversal_mode")
+
+                                sim = float(ot.evidence.get("pattern", {}).get("similarity", 100.0))
+                                if min_sim is not None and sim < float(min_sim):
+                                    continue
+                                if max_risk is not None and float(ot.risk_score) > float(max_risk):
+                                    continue
+                                if rev_mode in ("off", False) and ot.pattern_type == "reversal":
+                                    continue
+
+                                champion_tracker.record_shadow_result(
+                                    profile_name=p_name,
+                                    result=result,
+                                    payout=ot.payout,
+                                )
                 else:
                     remaining_open.append(ot)
 
@@ -274,6 +330,21 @@ class BacktestEngine:
 
             # 3. Query closed backtest trades as of cur_t for statistical inputs
             as_of_closed = [t for t in settled_trades if t.closed_at and datetime.fromisoformat(t.closed_at) <= cur_t]
+
+            # Advance adaptive layer if enabled
+            if enable_adaptive and adaptive_ctrl and champion_tracker and context_tracker:
+                adaptive_state = adaptive_ctrl.step(equity=equity, closed_trades=as_of_closed, now=cur_t)
+                time_in_tier[adaptive_state.tier] = time_in_tier.get(adaptive_state.tier, 0) + 1
+
+                new_champ, switch_reason = champion_tracker.evaluate_switch(now=cur_t)
+                if new_champ:
+                    profile_switches += 1
+                active_profile = champion_tracker.champion_name
+                step_cfg = effective_config(cfg, adaptive_state=adaptive_state, active_profile=active_profile)
+            else:
+                adaptive_state = None
+                step_cfg = cfg
+
             stats_as_of = {}
             for asset in self.data_by_asset.keys():
                 stats_as_of[asset] = compute_asset_stats(
@@ -286,7 +357,7 @@ class BacktestEngine:
             current_hour_risk = hour_risk(
                 as_of_closed,
                 hour=cur_t.hour,
-                session_min_samples=cfg.risk.session_min_samples,
+                session_min_samples=step_cfg.risk.session_min_samples,
                 mode="backtest",
                 as_of=cur_t,
             )
@@ -297,14 +368,14 @@ class BacktestEngine:
 
             for asset, p_data in self.data_by_asset.items():
                 sliced_candles = p_data.slice_as_of(cur_t)
-                payout = getattr(cfg.backtest, "default_payout", 0.85)
+                payout = getattr(step_cfg.backtest, "default_payout", 0.85)
 
                 eval_result = build_candidates(
                     asset=asset,
                     t=cur_t,
                     candles_by_tf=sliced_candles,
                     stats_as_of=stats_as_of,
-                    config=cfg,
+                    config=step_cfg,
                     hour_risk_val=current_hour_risk,
                     payout=payout,
                     pattern_library=self.pattern_library,
@@ -323,6 +394,34 @@ class BacktestEngine:
                 if eval_result.candidates:
                     step_candidates.extend(eval_result.candidates)
                     candidates_by_asset[asset] = eval_result.candidates
+
+            # Adaptive filter: skip if PAUSED, filter suspended contexts & max risk cap
+            if enable_adaptive and adaptive_state is not None and context_tracker:
+                if not adaptive_state.real_trading_allowed:
+                    skip_counts["adaptive_paused"] = skip_counts.get("adaptive_paused", 0) + len(step_candidates)
+                    step_candidates = []
+                    candidates_by_asset = {}
+                else:
+                    risk_cap = getattr(step_cfg.risk, "max_risk_cap", None)
+                    filtered_by_asset = {}
+                    filtered_step_candidates = []
+
+                    for a, cands in candidates_by_asset.items():
+                        cands_qual, skips = context_tracker.filter_candidates(cands, expiry_minutes=expiry_minutes)
+                        for sk in skips:
+                            skip_counts[sk] = skip_counts.get(sk, 0) + 1
+                        surviving = []
+                        for c in cands_qual:
+                            if risk_cap is not None and float(c.risk_report.score) > float(risk_cap):
+                                skip_counts["risk_cap"] = skip_counts.get("risk_cap", 0) + 1
+                            else:
+                                surviving.append(c)
+                        if surviving:
+                            filtered_by_asset[a] = surviving
+                            filtered_step_candidates.extend(surviving)
+
+                    candidates_by_asset = filtered_by_asset
+                    step_candidates = filtered_step_candidates
 
             # Select and commit trades according to decision_policy
             if cfg.backtest.decision_policy == "llm":
@@ -446,24 +545,29 @@ class BacktestEngine:
                     equity = compute_equity(cash, current_open_stakes)
 
                     target_pct = cand.max_stake_pct
-                    if cfg.backtest.stake_policy == "mid":
-                        target_pct = (cfg.stake.min_pct + target_pct) / 2.0
-                    elif cfg.backtest.stake_policy == "min":
-                        target_pct = cfg.stake.min_pct
+                    if step_cfg.backtest.stake_policy == "mid":
+                        target_pct = (step_cfg.stake.min_pct + target_pct) / 2.0
+                    elif step_cfg.backtest.stake_policy == "min":
+                        target_pct = step_cfg.stake.min_pct
+
+                    # Scale stake by adaptive stake scale
+                    stake_scale = getattr(step_cfg.stake, "stake_scale", 1.0)
+                    target_pct = target_pct * stake_scale
 
                     stake = stake_amount(
                         equity=equity,
                         pct=target_pct,
-                        min_amount=cfg.stake.min_amount,
-                        round_to=cfg.stake.round_to,
+                        min_amount=step_cfg.stake.min_amount,
+                        round_to=step_cfg.stake.round_to,
+                        max_amount=step_cfg.stake.max_amount,
                     )
 
                     if stake is None:
                         skip_counts["stake_below_min"] += 1
                         continue
 
-                    # c) Exposure cap (cfg.stake.total_cap_pct converted from percentage)
-                    total_cap_fraction = cfg.stake.total_cap_pct / 100.0
+                    # c) Exposure cap (step_cfg.stake.total_cap_pct converted from percentage)
+                    total_cap_fraction = step_cfg.stake.total_cap_pct / 100.0
                     if (current_open_stakes + stake) > (total_cap_fraction * equity):
                         skip_counts["exposure_cap"] += 1
                         continue
@@ -568,4 +672,9 @@ class BacktestEngine:
             skip_counts=skip_counts,
             total_steps=total_steps,
             variant_name=variant_name,
+            adaptive_enabled=bool(enable_adaptive),
+            adaptive_state=adaptive_ctrl.state if adaptive_ctrl else None,
+            time_in_tier=time_in_tier if enable_adaptive else {},
+            profile_switches=profile_switches if enable_adaptive else 0,
+            context_suspensions=len(context_tracker.suspended_contexts) if context_tracker else 0,
         )

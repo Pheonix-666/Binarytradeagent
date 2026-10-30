@@ -78,6 +78,18 @@ class CandidateReportItem(BaseModel):
     atr: Optional[float] = None
 
 
+class AdaptiveReportItem(BaseModel):
+    """Read-only adaptive regulator telemetry included in LLM report."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    tier: str = "NORMAL"
+    stake_scale: float = 1.0
+    min_similarity_add: float = 0.0
+    max_risk_cap: Optional[float] = None
+    real_trading_allowed: bool = True
+
+
 class DecisionReport(BaseModel):
     """Complete structured JSON report supplied to the LLM."""
 
@@ -90,6 +102,7 @@ class DecisionReport(BaseModel):
     remaining_exposure_pct: float
     min_stake_pct: float
     candidates: list[CandidateReportItem]
+    adaptive_state: Optional[AdaptiveReportItem] = None
 
 
 # ── Section 7.3: LLM Decision Output Models ───────────────────────────
@@ -142,6 +155,7 @@ class SystemState:
     current_prices: dict[str, float] = field(default_factory=dict)
     open_trades: list[Any] = field(default_factory=list)
     asset_modes: dict[str, str] = field(default_factory=dict)
+    adaptive_state: Optional[Any] = None
 
 
 @dataclass

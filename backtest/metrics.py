@@ -435,3 +435,112 @@ def compute_baseline_comparison(
         beats_random_band=beats_band,
         summary=summary,
     )
+
+
+def generate_adaptive_comparison_report(
+    result_off: Any,
+    result_on: Any,
+    target_win_rate: float = 0.80,
+) -> str:
+    """Generate Markdown comparison report of backtest run with adaptive OFF vs ON.
+
+    Compares side by side:
+      - Final equity & return
+      - Max drawdown
+      - Trades taken (total, wins, losses)
+      - Win rate with Wilson 95% CI
+      - Time spent in each tier
+      - Profile switches and context suspensions
+      - Explanatory note if ON run traded significantly less
+      - Warning: Do NOT tune adaptive thresholds on the test period
+    """
+    def _metrics(res: Any) -> tuple[int, int, int, float, tuple[float, float], float]:
+        trades = getattr(res, "trades", [])
+        wins = sum(1 for t in trades if getattr(t, "result", "") == "WIN")
+        losses = sum(1 for t in trades if getattr(t, "result", "") == "LOSS")
+        valid = wins + losses
+        wr = (wins / valid) if valid > 0 else 0.0
+        ci = wilson_interval(wins, valid) if valid > 0 else (0.0, 0.0)
+        ret = ((res.final_equity - res.starting_balance) / res.starting_balance) * 100.0 if res.starting_balance > 0 else 0.0
+        return len(trades), wins, losses, wr, ci, ret
+
+    n_off, w_off, l_off, wr_off, ci_off, ret_off = _metrics(result_off)
+    n_on, w_on, l_on, wr_on, ci_on, ret_on = _metrics(result_on)
+
+    tier_times = getattr(result_on, "time_in_tier", {})
+    total_tier_steps = sum(tier_times.values()) if tier_times else 1
+
+    lines = [
+        "# Adaptive Layer Comparative Evaluation: OFF vs ON",
+        "",
+        "> [!WARNING]",
+        "> **Do NOT tune adaptive thresholds on the test period.**",
+        "> Adaptive parameters must be configured a priori from risk management principles,",
+        "> not optimized to fit backtest results.",
+        "",
+        "## Performance Comparison",
+        "",
+        "| Metric | Adaptive OFF (Baseline) | Adaptive ON | Difference |",
+        "|---|---|---|---|",
+        f"| **Starting Balance** | ${result_off.starting_balance:,.2f} | ${result_on.starting_balance:,.2f} | $0.00 |",
+        f"| **Final Equity** | ${result_off.final_equity:,.2f} | ${result_on.final_equity:,.2f} | ${result_on.final_equity - result_off.final_equity:+,.2f} |",
+        f"| **Total Return** | {ret_off:+.2f}% | {ret_on:+.2f}% | {ret_on - ret_off:+.2f}% |",
+        f"| **Max Drawdown** | {result_off.max_drawdown * 100:.2f}% | {result_on.max_drawdown * 100:.2f}% | {(result_on.max_drawdown - result_off.max_drawdown) * 100:+.2f}% |",
+        f"| **Trades Taken** | {n_off} (W: {w_off}, L: {l_off}) | {n_on} (W: {w_on}, L: {l_on}) | {n_on - n_off:+d} trades |",
+        f"| **Win Rate** | {wr_off * 100:.1f}% | {wr_on * 100:.1f}% | {(wr_on - wr_off) * 100:+.1f}% |",
+        f"| **Wilson 95% CI** | [{ci_off[0] * 100:.1f}%, {ci_off[1] * 100:.1f}%] | [{ci_on[0] * 100:.1f}%, {ci_on[1] * 100:.1f}%] | - |",
+        "",
+    ]
+
+    # Explicit note when ON traded much less
+    if n_off > 0 and n_on < n_off:
+        diff_trades = n_off - n_on
+        pct_filtered = (diff_trades / n_off) * 100.0
+
+        switches = getattr(result_on, "profile_switches", 0)
+        suspensions = getattr(result_on, "context_suspensions", 0)
+        paused_steps = tier_times.get("PAUSED", 0)
+        pause_events = 0
+        if getattr(result_on, "adaptive_state", None) and hasattr(result_on.adaptive_state, "history"):
+            pause_events = sum(1 for h in result_on.adaptive_state.history if h.get("to_tier") == "PAUSED")
+
+        actions = []
+        if pause_events > 0 or paused_steps > 0:
+            p_count = pause_events if pause_events > 0 else 1
+            actions.append(f"{p_count} pauses ({paused_steps} steps in PAUSED)")
+        if suspensions > 0:
+            actions.append(f"{suspensions} context suspensions")
+        if switches > 0:
+            actions.append(f"{switches} profile switches")
+
+        if actions:
+            action_desc = f" Interventions: {', '.join(actions)}."
+        else:
+            action_desc = " The adaptive regulator tightened risk thresholds and filtered lower-ranking candidate setups."
+
+        lines.extend([
+            "> [!NOTE]",
+            f"> **Selective Trading:** Adaptive mode executed {n_on} trades vs {n_off} in baseline "
+            f"({diff_trades} fewer trades, {pct_filtered:.1f}% reduction).{action_desc}",
+            "",
+        ])
+
+    lines.extend([
+        "## Adaptive Regulator Telemetry",
+        "",
+        f"- **Profile Switches:** `{getattr(result_on, 'profile_switches', 0)}`",
+        f"- **Active Context Suspensions:** `{getattr(result_on, 'context_suspensions', 0)}`",
+        f"- **Final State Tier:** `{getattr(result_on.adaptive_state, 'tier', 'N/A') if getattr(result_on, 'adaptive_state', None) else 'N/A'}`",
+        "",
+        "### Time Spent in Tiers",
+        "",
+        "| Tier | Steps Spent | % of Simulation |",
+        "|---|---|---|",
+    ])
+
+    for t_name in ("NORMAL", "CAUTION", "DEFENSIVE", "PAUSED"):
+        steps = tier_times.get(t_name, 0)
+        pct = (steps / total_tier_steps) * 100.0 if total_tier_steps > 0 else 0.0
+        lines.append(f"| `{t_name}` | {steps} | {pct:.1f}% |")
+
+    return "\n".join(lines)

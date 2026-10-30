@@ -22,6 +22,7 @@ import pytest
 
 from analysis.candidates import build_candidates
 from backtest.data_loader import (
+    PrecomputedAssetData,
     generate_synthetic_candles,
     precompute_asset_data,
 )
@@ -50,6 +51,21 @@ def base_config() -> AppConfig:
     cfg.stake.round_to = 1.0
     cfg.backtest.slippage_atr = 0.02
     return cfg
+
+
+def test_missing_ts_close_on_non_1m_raises_error(base_config):
+    """If ts_close is missing on any timeframe other than 1m, precompute/slice must raise ValueError."""
+    cal = CalendarConfig(type="always_open", daily_boundary_tz="UTC", daily_boundary_hour=0)
+    start_dt = datetime(2026, 8, 1, 0, 0, 0, tzinfo=timezone.utc)
+    df = generate_synthetic_candles("EURUSD", start_dt=start_dt, days=3, calendar=cal, seed=42)
+    p_data = precompute_asset_data("EURUSD", df, cal, base_config)
+
+    # Deliberately drop ts_close from 5m candles
+    p_data.candles_by_tf["5m"] = p_data.candles_by_tf["5m"].drop(columns=["ts_close"])
+    p_data.ts_indices.pop("5m", None)
+
+    with pytest.raises(ValueError, match="Missing required 'ts_close' column on timeframe '5m'"):
+        p_data.slice_as_of(start_dt + timedelta(days=2))
 
 
 # ── (1) Look-Ahead Guard Test ──────────────────────────────────────────
@@ -461,21 +477,73 @@ def test_boundary_and_intermediate_bar_closure_causality(base_config):
 
 
 def test_look_ahead_guard_perturbation_test(base_config):
-    """(2b) Perturbation test: replacing all 1m data with ts_close > t by noise leaves build_candidates identical."""
+    """(2b) Perturbation test: replacing all 1m data with ts_close > t by noise leaves build_candidates identical.
+    Non-vacuous: asserts >= 30 of the 50 times produced candidates and both CALL and PUT appeared.
+    """
     cal = CalendarConfig(type="always_open", daily_boundary_tz="UTC", daily_boundary_hour=0)
-    start_dt = datetime(2026, 8, 1, 0, 0, 0, tzinfo=timezone.utc)
-    df_clean = generate_synthetic_candles("EURUSD", start_dt=start_dt, days=6, calendar=cal, seed=777)
-    p_clean = precompute_asset_data("EURUSD", df_clean, cal, base_config)
+    start_dt = datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
 
-    # Pick 50 random times across day 3 to day 5
-    rng = np.random.default_rng(seed=999)
-    min_offset_m = 3 * 1440  # after 3 days of warmup
-    max_offset_m = 5 * 1440
-    random_offsets = rng.choice(np.arange(min_offset_m, max_offset_m, 15), size=50, replace=False)
+    # Fast responsive trend settings to allow rich candidate generation across chunks
+    cfg = base_config.model_copy(deep=True)
+    cfg.gate.trend.daily.ema_fast = 3
+    cfg.gate.trend.daily.ema_slow = 6
+    cfg.gate.trend.daily.adx_period = 3
+    cfg.gate.trend.daily.adx_min = 0.0
+    cfg.gate.trend.daily.warmup_multiplier = 1
+    cfg.gate.trend.h1.ema_fast = 3
+    cfg.gate.trend.h1.ema_slow = 6
+    cfg.gate.trend.h1.adx_period = 3
+    cfg.gate.trend.h1.adx_min = 0.0
+    cfg.gate.trend.h1.warmup_multiplier = 1
+    cfg.gate.trend.m15.ema_fast = 3
+    cfg.gate.trend.m15.ema_slow = 6
+    cfg.gate.trend.m15.adx_period = 3
+    cfg.gate.trend.m15.adx_min = 0.0
+    cfg.gate.trend.m15.warmup_multiplier = 1
+    cfg.patterns.min_similarity = 35.0
 
-    for offset in random_offsets:
-        t = start_dt + timedelta(minutes=int(offset))
+    # 4 alternating trend chunks (CALL, PUT, CALL, PUT)
+    chunks = []
+    cur = start_dt
+    p = 1.1000
+    for i in range(4):
+        edge = "CALL" if i % 2 == 0 else "PUT"
+        c_df = generate_synthetic_candles("EURUSD", start_dt=cur, days=4, base_price=p, calendar=cal, seed=50 + i, planted_edge=edge)
+        p = c_df["close"].iloc[-1]
+        cur = c_df["ts"].iloc[-1] + timedelta(minutes=1)
+        chunks.append(c_df)
 
+    df_clean = pd.concat(chunks, ignore_index=True)
+    p_clean = precompute_asset_data("EURUSD", df_clean, cal, cfg)
+
+    # Identify candidate steps for both directions
+    call_times = []
+    put_times = []
+    general_times = []
+    for offset in range(5 * 1440, 15 * 1440, 15):
+        t_step = start_dt + timedelta(minutes=offset)
+        sliced = p_clean.slice_as_of(t_step)
+        res = build_candidates("EURUSD", t=t_step, candles_by_tf=sliced, stats_as_of={}, config=cfg, payout=0.85, calendar=cal)
+        dirs = [c.direction.value for c in res.candidates]
+        if "CALL" in dirs:
+            call_times.append(t_step)
+        elif "PUT" in dirs:
+            put_times.append(t_step)
+        else:
+            general_times.append(t_step)
+
+    # Randomly pick 20 CALL, 20 PUT, and 10 general times (50 total, non-vacuous)
+    rng = np.random.default_rng(seed=777)
+    sel_call = rng.choice(call_times, size=20, replace=False).tolist()
+    sel_put = rng.choice(put_times, size=20, replace=False).tolist()
+    sel_gen = rng.choice(general_times, size=10, replace=False).tolist()
+    test_times = sel_call + sel_put + sel_gen
+    rng.shuffle(test_times)
+
+    times_with_candidates = 0
+    observed_directions = set()
+
+    for t in test_times:
         # 1. Evaluate candidates on clean data
         clean_sliced = p_clean.slice_as_of(t)
         res_clean = build_candidates(
@@ -483,10 +551,15 @@ def test_look_ahead_guard_perturbation_test(base_config):
             t=t,
             candles_by_tf=clean_sliced,
             stats_as_of={},
-            config=base_config,
+            config=cfg,
             payout=0.85,
             calendar=cal,
         )
+
+        if res_clean.candidates:
+            times_with_candidates += 1
+            for c in res_clean.candidates:
+                observed_directions.add(c.direction.value)
 
         # 2. Corrupt/perturb ALL 1m data with ts_close > t with extreme random noise
         df_perturbed = df_clean.copy()
@@ -500,7 +573,7 @@ def test_look_ahead_guard_perturbation_test(base_config):
             df_perturbed.loc[future_mask, "close"] = noise * 1.2
 
         # Recompute multi-timeframe data from perturbed 1m candles
-        p_perturbed = precompute_asset_data("EURUSD", df_perturbed, cal, base_config)
+        p_perturbed = precompute_asset_data("EURUSD", df_perturbed, cal, cfg)
         perturbed_sliced = p_perturbed.slice_as_of(t)
 
         res_perturbed = build_candidates(
@@ -508,7 +581,7 @@ def test_look_ahead_guard_perturbation_test(base_config):
             t=t,
             candles_by_tf=perturbed_sliced,
             stats_as_of={},
-            config=base_config,
+            config=cfg,
             payout=0.85,
             calendar=cal,
         )
@@ -529,6 +602,66 @@ def test_look_ahead_guard_perturbation_test(base_config):
             assert c_clean.gate_result.passed == c_pert.gate_result.passed
             assert c_clean.gate_result.reason == c_pert.gate_result.reason
             assert c_clean.max_stake_pct == c_pert.max_stake_pct
+
+    # Assert non-vacuous guard guarantees
+    assert times_with_candidates >= 30, f"Only {times_with_candidates}/50 produced candidates (requires >= 30)"
+    assert "CALL" in observed_directions, "CALL direction did not appear in perturbation test"
+    assert "PUT" in observed_directions, "PUT direction did not appear in perturbation test"
+
+
+def test_perturbation_guard_catches_look_ahead_leak(base_config, monkeypatch):
+    """TEST THE TEST: monkeypatching slice_as_of to use ts instead of ts_close MUST cause the perturbation guard to fail."""
+    cal = CalendarConfig(type="always_open", daily_boundary_tz="UTC", daily_boundary_hour=0)
+    start_dt = datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+
+    cfg = base_config.model_copy(deep=True)
+    cfg.gate.trend.daily.ema_fast = 3
+    cfg.gate.trend.daily.ema_slow = 6
+    cfg.gate.trend.daily.adx_period = 3
+    cfg.gate.trend.daily.adx_min = 0.0
+    cfg.gate.trend.daily.warmup_multiplier = 1
+    cfg.gate.trend.h1.ema_fast = 3
+    cfg.gate.trend.h1.ema_slow = 6
+    cfg.gate.trend.h1.adx_period = 3
+    cfg.gate.trend.h1.adx_min = 0.0
+    cfg.gate.trend.h1.warmup_multiplier = 1
+    cfg.gate.trend.m15.ema_fast = 3
+    cfg.gate.trend.m15.ema_slow = 6
+    cfg.gate.trend.m15.adx_period = 3
+    cfg.gate.trend.m15.adx_min = 0.0
+    cfg.gate.trend.m15.warmup_multiplier = 1
+    cfg.patterns.min_similarity = 35.0
+
+    df_clean = generate_synthetic_candles("EURUSD", start_dt=start_dt, days=10, calendar=cal, seed=42, planted_edge="CALL")
+    p_clean = precompute_asset_data("EURUSD", df_clean, cal, cfg)
+
+    # Monkeypatch leaky slice_as_of using ts <= t instead of ts_close <= t
+    def leaky_slice_as_of(self, t: datetime):
+        t_utc = t.astimezone(timezone.utc) if t.tzinfo else t.replace(tzinfo=timezone.utc)
+        return {tf: df[df["ts"] <= t_utc] for tf, df in self.candles_by_tf.items()}
+
+    monkeypatch.setattr(PrecomputedAssetData, "slice_as_of", leaky_slice_as_of)
+
+    # Pick a time t between boundaries (e.g. 5m / 15m)
+    t = start_dt + timedelta(days=8, hours=3, minutes=7)
+    clean_sliced = p_clean.slice_as_of(t)
+    res_clean = build_candidates("EURUSD", t=t, candles_by_tf=clean_sliced, stats_as_of={}, config=cfg, payout=0.85, calendar=cal)
+
+    # Corrupt future
+    df_perturbed = df_clean.copy()
+    future_mask = df_perturbed["ts_close"] > t
+    df_perturbed.loc[future_mask, "open"] = 99.0
+    df_perturbed.loc[future_mask, "high"] = 150.0
+    df_perturbed.loc[future_mask, "low"] = 50.0
+    df_perturbed.loc[future_mask, "close"] = 120.0
+    p_perturbed = precompute_asset_data("EURUSD", df_perturbed, cal, cfg)
+    perturbed_sliced = p_perturbed.slice_as_of(t)
+    res_perturbed = build_candidates("EURUSD", t=t, candles_by_tf=perturbed_sliced, stats_as_of={}, config=cfg, payout=0.85, calendar=cal)
+
+    # Assert that the perturbation check FAILS (the leak is detected!)
+    assert len(res_clean.candidates) > 0, "Expected at least one candidate for leak test"
+    with pytest.raises(AssertionError):
+        assert abs(res_clean.candidates[0].current_price - res_perturbed.candidates[0].current_price) < 1e-5
 
 
 def test_exposure_cap_enforced_across_multiple_assets_in_same_step(base_config, monkeypatch):
