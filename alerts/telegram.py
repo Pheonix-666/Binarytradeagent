@@ -73,7 +73,8 @@ class TelegramAlerter:
         })
 
         if not self.is_configured:
-            logger.info("Telegram alert not sent (token/chat_id not configured in environment): %s", message)
+            safe_msg = message.encode("ascii", "replace").decode("ascii")
+            logger.info("Telegram alert not sent (token/chat_id not configured in environment): %s", safe_msg)
             self.consecutive_failures = 0
             return False
 

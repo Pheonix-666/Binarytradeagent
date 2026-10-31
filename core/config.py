@@ -481,7 +481,7 @@ class AdaptiveConfig(BaseModel):
         return v
 
 
-# ── Execution config ───────────────────────────────────────────────────
+# ── Execution, Source, Orchestrator & Paper Configs ───────────────────
 
 
 class ExecutionConfig(BaseModel):
@@ -490,6 +490,45 @@ class ExecutionConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     demo_bypasses_paper_gate: bool = Field(default=False)
+    confirm_mode: Literal["auto", "telegram_confirm"] = "auto"
+    confirm_timeout_seconds: int = Field(ge=1, default=60)
+
+
+class SourceConfig(BaseModel):
+    """Market data price source parameters."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: Literal["replay", "crypto_public", "binomo_readonly"] = "replay"
+    assets: list[str] = Field(default_factory=lambda: ["EURUSD", "GBPUSD", "USDJPY"])
+    replay_dir: str = "data_history"
+    rest_timeout_seconds: float = Field(gt=0, default=10.0)
+    max_retries: int = Field(ge=0, default=3)
+    backoff_base_seconds: float = Field(gt=0, default=1.0)
+    public_api_url: str = "https://data-api.binance.vision/api/v3"
+
+
+class OrchestratorConfig(BaseModel):
+    """Orchestration and scheduler parameters."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    candle_delay_seconds: int = Field(ge=0, default=5)
+    heartbeat_hours: int = Field(ge=1, default=6)
+    summary_hour_utc: int = Field(ge=0, le=23, default=0)
+    max_cycle_duration_seconds: int = Field(ge=1, default=300)
+    reports_dir: str = "reports/daily"
+    warmup_bars: dict[str, int] = Field(default_factory=dict)
+
+
+class PaperConfig(BaseModel):
+    """Paper mode execution parameters."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    decision_mode: Literal["llm", "policy"] = "policy"
+    entry_delay_bars: int = Field(ge=0, default=1)
+    slippage_atr: float = Field(ge=0, default=0.02)
 
 
 # ── Root config ───────────────────────────────────────────────────────
@@ -512,6 +551,9 @@ class AppConfig(BaseModel):
     selection: SelectionConfig = Field(default_factory=SelectionConfig)
     safety: SafetyConfig
     execution: ExecutionConfig = Field(default_factory=ExecutionConfig)
+    source: SourceConfig = Field(default_factory=SourceConfig)
+    orchestrator: OrchestratorConfig = Field(default_factory=OrchestratorConfig)
+    paper: PaperConfig = Field(default_factory=PaperConfig)
     llm: LLMConfig
     alerts: AlertsConfig
     backtest: BacktestConfig

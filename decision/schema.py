@@ -180,4 +180,5 @@ class ValidatedDecision:
     pattern_name: Optional[str] = None
     pattern_type: Optional[str] = None
     risk_score: Optional[int] = None
+    payout: Optional[float] = None
     is_otc: bool = False

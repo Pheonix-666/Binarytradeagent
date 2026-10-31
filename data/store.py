@@ -266,6 +266,51 @@ class DataStore:
 
         return df
 
+    def get_latest_candle_time(
+        self,
+        asset_id: str,
+        timeframe: str,
+    ) -> Optional[datetime]:
+        """Return the ts of the latest stored candle for asset_id and timeframe, or None."""
+        query = "SELECT MAX(ts) FROM candles WHERE asset_id = ? AND timeframe = ?"
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(query, (asset_id, timeframe))
+            row = cursor.fetchone()
+            if row and row[0]:
+                dt = pd.to_datetime(row[0], utc=True)
+                return dt.to_pydatetime()
+        return None
+
+    def sync_candles_from_source(
+        self,
+        source: Any,
+        asset_id: str,
+        timeframe: str,
+        n_needed: int = 200,
+    ) -> pd.DataFrame:
+        """Incrementally fetch new closed candles from source, cache them in SQLite, and return the latest n_needed bars."""
+        latest_ts = self.get_latest_candle_time(asset_id, timeframe)
+        if latest_ts is None:
+            # Initial cold start: fetch n_needed bars from source
+            df_new = source.get_candles(asset_id, timeframe, n_needed)
+            if not df_new.empty:
+                self.save_candles(asset_id, timeframe, df_new)
+        else:
+            now = source.now()
+            delta = now - latest_ts
+            from data.candle_builder import TIMEFRAME_DELTAS
+            tf_delta = TIMEFRAME_DELTAS.get(timeframe, timedelta(minutes=1))
+            missing_bars = int(delta / tf_delta) + 2
+            fetch_n = max(5, min(missing_bars, n_needed))
+            df_candidates = source.get_candles(asset_id, timeframe, fetch_n)
+            if not df_candidates.empty:
+                df_new = df_candidates[df_candidates["ts"] > latest_ts]
+                if not df_new.empty:
+                    self.save_candles(asset_id, timeframe, df_new)
+
+        return self.get_candles(asset_id, timeframe, n=n_needed)
+
     def save_payout(self, quote: AssetQuote, ts: Optional[datetime] = None) -> None:
         """Save a single asset quote and payout snapshot."""
         self.save_payouts([quote], ts=ts)
@@ -350,14 +395,39 @@ class DataStore:
         return df
 
 
+def normalize_trade_timestamp(ts: Union[str, datetime, None]) -> Optional[str]:
+    """Normalize any timestamp to standard ISO-8601 UTC string (%Y-%m-%dT%H:%M:%SZ)."""
+    if ts is None:
+        return None
+    if isinstance(ts, str):
+        if not ts.strip():
+            return None
+        dt = pd.to_datetime(ts, utc=True).to_pydatetime()
+        return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+    if isinstance(ts, datetime):
+        if ts.tzinfo is None:
+            dt = ts.replace(tzinfo=timezone.utc)
+        else:
+            dt = ts.astimezone(timezone.utc)
+        return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+    dt = pd.to_datetime(ts, utc=True).to_pydatetime()
+    return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 class TradeRepository:
     """Repository for CRUD operations on the SQLite trades table."""
 
-    def __init__(self, data_store: DataStore):
-        self.store = data_store
+    def __init__(self, data_store: Optional[DataStore] = None, store: Optional[DataStore] = None):
+        target_store = data_store if data_store is not None else store
+        if target_store is None:
+            raise ValueError("TradeRepository requires a DataStore instance")
+        self.store = target_store
 
     def insert(self, trade: TradeRecord) -> None:
-        """Insert a new trade record."""
+        """Insert a new trade record with normalized timestamps."""
+        opened_str = normalize_trade_timestamp(trade.opened_at)
+        closed_str = normalize_trade_timestamp(trade.closed_at)
+
         with self.store._get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute(
@@ -371,8 +441,8 @@ class TradeRepository:
                 """,
                 (
                     trade.id,
-                    trade.opened_at,
-                    trade.closed_at,
+                    opened_str,
+                    closed_str,
                     trade.asset,
                     1 if trade.is_otc else 0,
                     trade.direction,
@@ -398,14 +468,7 @@ class TradeRepository:
         pnl: float,
     ) -> bool:
         """Update closed_at, result (WIN/LOSS/TIE), and pnl for an existing trade."""
-        if isinstance(closed_at, datetime):
-            if closed_at.tzinfo is None:
-                closed_at = closed_at.replace(tzinfo=timezone.utc)
-            else:
-                closed_at = closed_at.astimezone(timezone.utc)
-            closed_str = closed_at.strftime("%Y-%m-%dT%H:%M:%SZ")
-        else:
-            closed_str = str(closed_at)
+        closed_str = normalize_trade_timestamp(closed_at)
 
         with self.store._get_connection() as conn:
             cursor = conn.cursor()
@@ -429,6 +492,8 @@ class TradeRepository:
             if not row:
                 return None
             return self._row_to_record(row)
+
+    get_trade = get_trade_by_id
 
     def get_trades(
         self,

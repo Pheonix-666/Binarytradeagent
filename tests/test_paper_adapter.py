@@ -34,14 +34,37 @@ def test_paper_adapter_place_trade_balance_deducted(paper_adapter):
         direction=TradeDirection.CALL,
         expiry_min=15,
         stake_amount=100.0,
+        payout=0.85,
     )
     assert receipt.stake_amount == 100.0
     assert receipt.direction == TradeDirection.CALL
+    assert receipt.payout == 0.85
     assert paper_adapter.get_balance() == 900.0
 
     open_trades = paper_adapter.get_open_trades()
     assert len(open_trades) == 1
     assert open_trades[0].result == TradeResult.PENDING
+
+
+def test_paper_adapter_payout_required(paper_adapter):
+    """PaperAdapter.place_trade must raise if payout is None or <= 0."""
+    with pytest.raises(ValueError, match="payout must be positive"):
+        paper_adapter.place_trade(
+            asset_id="EURUSD",
+            direction=TradeDirection.CALL,
+            expiry_min=15,
+            stake_amount=100.0,
+            payout=None,  # type: ignore
+        )
+
+    with pytest.raises(ValueError, match="payout must be positive"):
+        paper_adapter.place_trade(
+            asset_id="EURUSD",
+            direction=TradeDirection.CALL,
+            expiry_min=15,
+            stake_amount=100.0,
+            payout=-0.1,
+        )
 
 
 def test_paper_adapter_insufficient_balance(paper_adapter):
@@ -51,6 +74,7 @@ def test_paper_adapter_insufficient_balance(paper_adapter):
             direction=TradeDirection.CALL,
             expiry_min=15,
             stake_amount=1500.0,
+            payout=0.85,
         )
 
 
@@ -61,6 +85,7 @@ def test_paper_adapter_negative_stake(paper_adapter):
             direction=TradeDirection.CALL,
             expiry_min=15,
             stake_amount=-10.0,
+            payout=0.85,
         )
 
 
@@ -74,6 +99,7 @@ def test_paper_adapter_settle_call_win(paper_adapter):
         direction=TradeDirection.CALL,
         expiry_min=15,
         stake_amount=100.0,
+        payout=0.85,
     )
     # Entry price is 1.0 (from fallback dummy price)
     assert receipt.entry_price == 1.0
@@ -105,6 +131,7 @@ def test_paper_adapter_settle_call_loss(paper_adapter):
         direction=TradeDirection.CALL,
         expiry_min=30,
         stake_amount=100.0,
+        payout=0.85,
     )
     assert paper_adapter.get_balance() == 900.0
 
@@ -130,6 +157,7 @@ def test_paper_adapter_settle_put_win(paper_adapter):
         direction=TradeDirection.PUT,
         expiry_min=15,
         stake_amount=200.0,
+        payout=0.85,
     )
     assert paper_adapter.get_balance() == 800.0
 
@@ -155,6 +183,7 @@ def test_paper_adapter_settle_put_loss(paper_adapter):
         direction=TradeDirection.PUT,
         expiry_min=15,
         stake_amount=100.0,
+        payout=0.85,
     )
 
     expiry_time = start_time + timedelta(minutes=15)
@@ -179,6 +208,7 @@ def test_paper_adapter_settle_tie_refunds_stake(paper_adapter):
         direction=TradeDirection.CALL,
         expiry_min=15,
         stake_amount=100.0,
+        payout=0.85,
     )
 
     expiry_time = start_time + timedelta(minutes=15)

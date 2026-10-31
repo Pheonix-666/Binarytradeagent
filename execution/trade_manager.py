@@ -617,11 +617,13 @@ class TradeManager:
         if self.paper_adapter is None:
             raise RuntimeError("paper_adapter is required for paper/shadow execution")
 
+        payout = getattr(decision, "payout", None)
         receipt = self.paper_adapter.place_trade(
             asset_id=order.asset,
             direction=TradeDirection(order.direction),
             expiry_min=order.expiry_minutes,
             stake_amount=order.stake,
+            payout=payout,
             trade_id=trade_id,
         )
 
@@ -639,7 +641,9 @@ class TradeManager:
             if is_otc is None:
                 asset_str = str(order.asset)
                 is_otc = "_otc" in asset_str.lower() or "otc" in asset_str.lower()
-            shadow_payout = float(getattr(receipt, "payout", None) or 0.85)
+            if getattr(receipt, "payout", None) is None:
+                raise ValueError(f"Shadow receipt {trade_id} has no payout")
+            shadow_payout = float(receipt.payout)
 
             try:
                 record = TradeRecord(

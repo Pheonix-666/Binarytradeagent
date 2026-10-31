@@ -75,6 +75,7 @@ class FaultyAdapter:
         if self.raise_before_placed:
             raise ConnectionResetError("Broker placement failed: connection dropped before order sent")
 
+        kwargs.setdefault("payout", 0.85)
         receipt = self.underlying.place_trade(*args, **kwargs)
 
         if self.timeout_after_placed:
@@ -86,7 +87,7 @@ class FaultyAdapter:
         return receipt
 
 
-def _make_decision(asset="EURUSD", direction="CALL", stake=100.0, d_id="dec_fault_01") -> ValidatedDecision:
+def _make_decision(asset="EURUSD", direction="CALL", stake=100.0, d_id="dec_fault_01", payout=0.85) -> ValidatedDecision:
     return ValidatedDecision(
         decision=direction,
         is_valid=True,
@@ -95,8 +96,9 @@ def _make_decision(asset="EURUSD", direction="CALL", stake=100.0, d_id="dec_faul
         direction=direction,
         expiry_minutes=15,
         stake_pct=1.0,
+        payout=payout,
         decision_id=d_id,
-        evidence=DecisionEvidence(risk_score=20, similarity=85.0, trend_daily="up", trend_1h="up", payout=0.85),
+        evidence=DecisionEvidence(risk_score=20, similarity=85.0, trend_daily="up", trend_1h="up", payout=payout),
         reasoning="Fault injection test decision",
         checks_passed=["c1", "c2"],
         raw_decision=DecisionOutput(
@@ -247,10 +249,11 @@ def test_fault_process_restart_with_open_trade(tmp_path):
     state_file = tmp_path / "state.json"
     state_mgr = StateManager(state_file=state_file, first_run=True, broker_balance=10000.0)
     real_paper = PaperAdapter(initial_balance=10000.0)
+    faulty_adapter = FaultyAdapter(real_paper)
     breaker = CircuitBreaker(config=cfg)
     ks = KillSwitch(workspace_root=tmp_path)
 
-    tm = TradeManager(cfg, state_mgr, breaker, ks, adapter=real_paper, paper_adapter=real_paper)
+    tm = TradeManager(cfg, state_mgr, breaker, ks, adapter=faulty_adapter, paper_adapter=real_paper)
     tm.set_reconciled(True)
 
     account = AccountSnapshot(balance=10000.0, equity=10000.0, asset_modes={"EURUSD": "live_eligible"})

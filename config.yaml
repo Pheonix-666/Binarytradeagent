@@ -145,6 +145,29 @@ safety:
 
 execution:
   demo_bypasses_paper_gate: false
+  confirm_mode: auto
+  confirm_timeout_seconds: 60
+
+source:
+  name: replay
+  assets: ["EURUSD", "GBPUSD", "USDJPY"]
+  replay_dir: data_history
+  rest_timeout_seconds: 10.0
+  max_retries: 3
+  backoff_base_seconds: 1.0
+  public_api_url: "https://data-api.binance.vision/api/v3"
+
+orchestrator:
+  candle_delay_seconds: 5
+  heartbeat_hours: 6
+  summary_hour_utc: 0
+  max_cycle_duration_seconds: 300
+  reports_dir: reports/daily
+
+paper:
+  decision_mode: policy
+  entry_delay_bars: 1
+  slippage_atr: 0.02
 
 llm:
   provider: anthropic

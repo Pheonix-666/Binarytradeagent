@@ -1,5 +1,6 @@
 .env
 logs/
+reports/
 state/
 state/playwright_profile/
 __pycache__/
@@ -12,5 +13,6 @@ build/
 venv/
 data_history/
 docs/backtests/
+*.db
 collected.txt
 pytest_out.txt

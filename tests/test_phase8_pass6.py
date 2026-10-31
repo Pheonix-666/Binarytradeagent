@@ -51,6 +51,12 @@ from safety.killswitch import KillSwitch
 from safety.limits import AccountSnapshot, OrderRequest, check_order
 
 
+class BrokerPaperAdapter(PaperAdapter):
+    """Wraps PaperAdapter to fulfill PlatformAdapter (broker) interface in tests."""
+    def place_trade(self, asset_id, direction, expiry_min, stake_amount, payout=0.85, **kwargs):
+        return super().place_trade(asset_id, direction, expiry_min, stake_amount, payout=payout, **kwargs)
+
+
 class MockAlerter:
     def __init__(self):
         self.alerts: list[str] = []
@@ -65,7 +71,7 @@ class MockAlerter:
         return True
 
 
-def _make_decision(asset="EURUSD", direction="CALL", stake=100.0, d_id="dec_test_123"):
+def _make_decision(asset="EURUSD", direction="CALL", stake=100.0, d_id="dec_test_123", payout=0.85):
     return ValidatedDecision(
         decision=direction,
         is_valid=True,
@@ -74,8 +80,9 @@ def _make_decision(asset="EURUSD", direction="CALL", stake=100.0, d_id="dec_test
         direction=direction,
         expiry_minutes=15,
         stake_pct=1.0,
+        payout=payout,
         decision_id=d_id,
-        evidence=DecisionEvidence(risk_score=20, similarity=85.0, trend_daily="up", trend_1h="up", payout=0.85),
+        evidence=DecisionEvidence(risk_score=20, similarity=85.0, trend_daily="up", trend_1h="up", payout=payout),
         reasoning="Testing pass 6",
         checks_passed=["c1", "c2"],
         raw_decision=DecisionOutput(
@@ -103,7 +110,7 @@ def test_trade_manager_with_real_paper_adapter(tmp_path):
     breaker = CircuitBreaker(config=cfg)
     ks = KillSwitch(workspace_root=tmp_path)
 
-    real_paper_adapter = PaperAdapter(initial_balance=10000.0)
+    real_paper_adapter = BrokerPaperAdapter(initial_balance=10000.0)
     shadow_paper_adapter = PaperAdapter(initial_balance=10000.0)
     alerter = MockAlerter()
 
@@ -292,7 +299,7 @@ def test_modes_and_decision_id_enforcement(tmp_path):
     state_mgr = StateManager(state_file=tmp_path / "state.json", first_run=True, broker_balance=10000.0)
     breaker = CircuitBreaker(config=cfg)
     ks = KillSwitch(workspace_root=tmp_path)
-    paper_adapter = PaperAdapter(initial_balance=10000.0)
+    paper_adapter = BrokerPaperAdapter(initial_balance=10000.0)
 
     # 1. Record mode: places no orders at all
     cfg.mode = "record"
@@ -589,7 +596,7 @@ def test_trade_manager_pauses_to_shadow_on_consecutive_alert_failures(tmp_path):
     state_mgr = StateManager(state_file=tmp_path / "state.json", first_run=True, broker_balance=10000.0)
     breaker = CircuitBreaker(config=cfg)
     ks = KillSwitch(workspace_root=tmp_path)
-    paper_adapter = PaperAdapter(initial_balance=10000.0)
+    paper_adapter = BrokerPaperAdapter(initial_balance=10000.0)
     alerter = MockAlerter()
 
     tm = TradeManager(cfg, state_mgr, breaker, ks, adapter=paper_adapter, paper_adapter=paper_adapter, alerter=alerter)
@@ -617,7 +624,7 @@ def test_trade_manager_alerts_on_db_write_failure(tmp_path):
     state_mgr = StateManager(state_file=tmp_path / "state.json", first_run=True, broker_balance=10000.0)
     breaker = CircuitBreaker(config=cfg)
     ks = KillSwitch(workspace_root=tmp_path)
-    paper_adapter = PaperAdapter(initial_balance=10000.0)
+    paper_adapter = BrokerPaperAdapter(initial_balance=10000.0)
     alerter = MockAlerter()
 
     class FailingDbStore:

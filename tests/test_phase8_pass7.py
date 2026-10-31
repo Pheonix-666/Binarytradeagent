@@ -118,6 +118,7 @@ def _make_decision(
     pattern_type="reversal",
     risk_score=25,
     is_otc=False,
+    payout=0.85,
 ):
     return ValidatedDecision(
         decision=direction,
@@ -127,13 +128,14 @@ def _make_decision(
         direction=direction,
         expiry_minutes=15,
         stake_pct=1.0,
+        payout=payout,
         decision_id=d_id,
         evidence=DecisionEvidence(
             risk_score=risk_score,
             similarity=85.0,
             trend_daily="up",
             trend_1h="up",
-            payout=0.85,
+            payout=payout,
         ),
         reasoning="Phase 8 fix pass 7 test decision",
         checks_passed=["check_a", "check_b"],
@@ -230,6 +232,7 @@ def test_trade_manager_real_and_shadow_trade_logging_integration(tmp_path):
         risk_score=30,
         is_otc=True,
     )
+    paper.set_current_time(now)
     res_shadow = tm.execute(dec_shadow, account, adaptive_state=ad_state, now=now)
     assert res_shadow.executed is True
     assert res_shadow.is_shadow is True

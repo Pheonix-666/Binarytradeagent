@@ -47,12 +47,30 @@ class PaperAdapter(PlatformAdapter):
             self._candles[asset_id] = {}
         self._candles[asset_id][timeframe] = df.sort_values("ts").reset_index(drop=True)
 
-    def set_simulated_time(self, dt: datetime) -> None:
-        """Advance or set simulated time for backtesting/paper checks."""
+    def set_price(self, asset_id: str, price: float) -> None:
+        """Set an explicit current price for an asset."""
+        now = self._current_time or now_utc()
+        df = pd.DataFrame([{
+            "ts": now,
+            "ts_close": now + timedelta(minutes=1),
+            "open": float(price),
+            "high": float(price),
+            "low": float(price),
+            "close": float(price),
+            "volume": 1.0,
+        }])
+        self.set_candles(asset_id, "1m", df)
+
+    def set_current_time(self, dt: datetime) -> None:
+        """Set simulated clock time without settling trades."""
         if dt.tzinfo is None:
             self._current_time = dt.replace(tzinfo=timezone.utc)
         else:
             self._current_time = dt.astimezone(timezone.utc)
+
+    def set_simulated_time(self, dt: datetime) -> None:
+        """Advance or set simulated time for backtesting/paper checks."""
+        self.set_current_time(dt)
         self.settle_open_trades()
 
     def get_assets(self) -> list[AssetQuote]:
@@ -104,10 +122,13 @@ class PaperAdapter(PlatformAdapter):
         direction: TradeDirection | str,
         expiry_min: int,
         stake_amount: float,
+        payout: float,
         trade_id: Optional[str] = None,
         **kwargs: Any,
     ) -> TradeReceipt:
         """Execute a simulated fixed-time trade."""
+        if payout is None or payout <= 0:
+            raise ValueError(f"payout must be positive, got {payout}")
         if stake_amount <= 0:
             raise ValueError(f"stake_amount must be positive, got {stake_amount}")
         if stake_amount > self.balance:
@@ -120,7 +141,7 @@ class PaperAdapter(PlatformAdapter):
 
         entry_time = self._current_time or now_utc()
         entry_price = self._get_current_price(asset_id)
-        payout = self._get_payout(asset_id)
+        effective_payout = float(payout)
         tid = trade_id or f"paper_{uuid.uuid4().hex[:10]}"
 
         # Deduct stake from available balance
@@ -134,7 +155,7 @@ class PaperAdapter(PlatformAdapter):
             stake_amount=stake_amount,
             entry_price=entry_price,
             entry_time=entry_time,
-            payout=payout,
+            payout=effective_payout,
             platform_trade_id=tid,
         )
 

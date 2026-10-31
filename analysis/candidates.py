@@ -50,6 +50,22 @@ class CandidateTrade:
     max_stake_pct: float
     volatility_percentile: float
     evidence: dict[str, Any] = field(default_factory=dict)
+    pattern_name: Optional[str] = None
+    pattern_type: Optional[str] = None
+    risk_score: Optional[int] = None
+    payout: Optional[float] = None
+    is_otc: bool = False
+    expiry_minutes: int = 15
+
+    def __post_init__(self) -> None:
+        if self.pattern_name is None and self.pattern:
+            self.pattern_name = self.pattern.get("name")
+        if self.pattern_type is None and self.pattern:
+            self.pattern_type = self.pattern.get("type")
+        if self.risk_score is None and self.risk_report:
+            self.risk_score = self.risk_report.score
+        if self.payout is None and self.evidence:
+            self.payout = self.evidence.get("payout")
 
 
 @dataclass
@@ -76,6 +92,7 @@ def build_candidates(
     payout: Optional[float] = None,
     pattern_library: Optional[PatternLibrary] = None,
     calendar: Optional[CalendarConfig] = None,
+    is_otc: Optional[bool] = None,
 ) -> CandidateEvaluationResult:
     """Generate trade candidates for an asset at time t.
 
@@ -328,6 +345,7 @@ def build_candidates(
             "payout": effective_payout,
         }
 
+        resolved_is_otc = bool(is_otc if is_otc is not None else ("_otc" in asset.lower() or "otc" in asset.lower()))
         candidates.append(
             CandidateTrade(
                 asset=asset,
@@ -342,6 +360,11 @@ def build_candidates(
                 max_stake_pct=stake_pct,
                 volatility_percentile=vol_pct,
                 evidence=evidence,
+                pattern_name=best_pattern.get("name") if best_pattern else None,
+                pattern_type=best_pattern.get("type") if best_pattern else None,
+                risk_score=risk_report.score,
+                payout=effective_payout,
+                is_otc=resolved_is_otc,
             )
         )
 
