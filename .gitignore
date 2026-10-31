@@ -14,5 +14,6 @@ venv/
 data_history/
 docs/backtests/
 *.db
+discovery_report.md
 collected.txt
 pytest_out.txt

@@ -332,8 +332,8 @@ class BacktestConfig(BaseModel):
     starting_balance: float = Field(gt=0, default=10000.0)
     decision_policy: Literal["lowest_risk", "highest_similarity", "llm"] = "lowest_risk"
     stake_policy: Literal["max", "mid", "min"] = "max"
-    entry_delay_bars: int = Field(ge=0, default=1)
-    slippage_atr: float = Field(ge=0, default=0.02)
+    entry_delay_bars: Optional[int] = Field(ge=0, default=None)
+    slippage_atr: Optional[float] = Field(ge=0, default=None)
     tie_policy: Optional[Literal["refund", "loss"]] = Field(default=None)
     ignore_paper_gate: bool = Field(default=True)
     max_llm_steps: int = Field(ge=1, default=200)
@@ -521,14 +521,24 @@ class OrchestratorConfig(BaseModel):
     warmup_bars: dict[str, int] = Field(default_factory=dict)
 
 
+class ExecutionModelConfig(BaseModel):
+    """Common execution model parameters shared by backtest and paper."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    entry_delay_bars: int = Field(ge=0, default=1)
+    slippage_atr: float = Field(ge=0, default=0.02)
+
+
 class PaperConfig(BaseModel):
     """Paper mode execution parameters."""
 
     model_config = ConfigDict(extra="forbid")
 
     decision_mode: Literal["llm", "policy"] = "policy"
-    entry_delay_bars: int = Field(ge=0, default=1)
-    slippage_atr: float = Field(ge=0, default=0.02)
+    stake_policy: Optional[Literal["max", "mid", "min"]] = Field(default=None)
+    entry_delay_bars: Optional[int] = Field(ge=0, default=None)
+    slippage_atr: Optional[float] = Field(ge=0, default=None)
 
 
 # ── Root config ───────────────────────────────────────────────────────
@@ -553,11 +563,29 @@ class AppConfig(BaseModel):
     execution: ExecutionConfig = Field(default_factory=ExecutionConfig)
     source: SourceConfig = Field(default_factory=SourceConfig)
     orchestrator: OrchestratorConfig = Field(default_factory=OrchestratorConfig)
+    execution_model: ExecutionModelConfig = Field(default_factory=ExecutionModelConfig)
     paper: PaperConfig = Field(default_factory=PaperConfig)
     llm: LLMConfig
     alerts: AlertsConfig
     backtest: BacktestConfig
     adaptive: AdaptiveConfig = Field(default_factory=AdaptiveConfig)
+
+    @model_validator(mode="after")
+    def _sync_execution_model(self) -> "AppConfig":
+        if hasattr(self, "execution_model"):
+            if hasattr(self, "backtest"):
+                if self.backtest.entry_delay_bars is None:
+                    self.backtest.entry_delay_bars = self.execution_model.entry_delay_bars
+                if self.backtest.slippage_atr is None:
+                    self.backtest.slippage_atr = self.execution_model.slippage_atr
+            if hasattr(self, "paper"):
+                if self.paper.entry_delay_bars is None:
+                    self.paper.entry_delay_bars = self.execution_model.entry_delay_bars
+                if self.paper.slippage_atr is None:
+                    self.paper.slippage_atr = self.execution_model.slippage_atr
+                if self.paper.stake_policy is None and hasattr(self, "backtest"):
+                    self.paper.stake_policy = self.backtest.stake_policy
+        return self
 
     @model_validator(mode="after")
     def _sync_tie_policy(self) -> "AppConfig":

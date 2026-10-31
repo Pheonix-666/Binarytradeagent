@@ -77,3 +77,20 @@ class PaperEntryModel:
             expiry_minutes=int(expiry_minutes),
         )
 
+
+def calculate_entry_price(
+    open_price: float,
+    direction: Union[TradeDirection, str],
+    atr: Optional[float] = None,
+    slippage_atr: float = 0.02,
+) -> float:
+    """Calculate entry price from bar open price and slippage (matches backtest logic)."""
+    if isinstance(direction, str):
+        direction = TradeDirection(direction.upper())
+    effective_atr = atr if atr is not None and atr > 0 else 0.0
+    slippage = float(slippage_atr) * effective_atr
+    if direction == TradeDirection.CALL:
+        return float(open_price + slippage)
+    else:
+        return float(open_price - slippage)
+

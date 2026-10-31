@@ -1,155 +1,289 @@
 """Platform discovery tool — inspects platform traffic and DOM read-only.
 
 Usage:
-    python tools/discover_platform.py [--url https://...] [--duration 60]
+    python tools/discover_platform.py --url https://platform.example.com [--duration 900]
 
 Safety Rule:
-    This tool NEVER clicks any trade button. It is strictly READ-ONLY.
-    It launches a persistent Playwright browser profile, waits for the user to log in,
-    monitors network requests and WebSocket frames, and compiles discovery_report.md.
+    This tool NEVER clicks, fills, types, presses, checks, or evaluates anything.
+    It is strictly READ-ONLY. It launches a persistent Playwright browser profile,
+    attaches listeners to all pages, monitors network requests and WebSocket frames,
+    redacts all credentials and identifiers, and compiles discovery_report.md.
 """
 
 from __future__ import annotations
 
 import argparse
+from datetime import datetime, timezone
 import json
+from pathlib import Path
 import re
 import sys
 import time
-from datetime import datetime, timezone
-from pathlib import Path
-from typing import Any
-
-from playwright.sync_api import Request, Response, WebSocket, sync_playwright
+from typing import Any, Optional
+import urllib.parse
 
 
 PROFILE_DIR = Path("state") / "playwright_profile"
 REPORT_PATH = Path("discovery_report.md")
 
+# ── Redaction Configuration ───────────────────────────────────────────────────
+
+SAFE_KEYS = {
+    "price", "bid", "ask", "open", "high", "low", "close", "rate",
+    "payout", "profit", "percent", "ts", "time", "timestamp",
+    "symbol", "name", "pair", "ticker", "asset", "type", "event",
+    "action", "status", "expiry", "duration",
+}
+
+ALWAYS_MASK_KEY_REGEX = re.compile(
+    r"token|auth|session|cookie|password|secret|key|email|phone|user|uid|account|ssid|jwt",
+    re.IGNORECASE,
+)
+
+BALANCE_KEY_REGEX = re.compile(r"balance", re.IGNORECASE)
+
+SKIP_URL_REGEX = re.compile(
+    r"login|auth|token|session|signin|password|oauth",
+    re.IGNORECASE,
+)
+
+JWT_REGEX = re.compile(r"^[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}$")
+EMAIL_REGEX = re.compile(r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+")
+PHONE_REGEX = re.compile(r"(?:\+?\d{1,3}[-.\s]?)?(?:\(?\d{2,4}\)?[-.\s]?)?\d{3,4}[-.\s]?\d{3,4}")
+IP_REGEX = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
+LONG_HEX_B64_REGEX = re.compile(r"^[A-Za-z0-9+/=_-]{25,}$")
+
+CATEGORY_KEYS = {
+    "balance": {"balance", "balances", "demo_balance", "live_balance", "account_balance"},
+    "trade/order": {"order", "orders", "trade", "trades", "deal", "deals", "position", "positions"},
+    "payout": {"payout", "payouts", "profit_percent", "yield", "rate_payout"},
+    "price": {"price", "bid", "ask", "quote", "candles", "candle", "ohlc", "rates", "rate", "tick", "ticks"},
+    "assets": {"assets", "instruments", "actives", "pairs", "currencies"},
+}
+
+
+class PayloadRedactor:
+    """Recursively redacts JSON objects and string values according to strict rules."""
+
+    def __init__(self) -> None:
+        self.redaction_count = 0
+
+    def is_sensitive_value(self, val: str) -> bool:
+        """Check if a string matches sensitive patterns like JWT, email, phone, IP, or long token."""
+        if JWT_REGEX.match(val):
+            return True
+        if EMAIL_REGEX.search(val):
+            return True
+        if IP_REGEX.search(val):
+            return True
+        if len(val) > 24 and LONG_HEX_B64_REGEX.match(val):
+            return True
+        # Check for typical phone number format
+        if len(val) >= 9 and PHONE_REGEX.search(val) and sum(c.isdigit() for c in val) >= 7:
+            return True
+        return False
+
+    def redact(self, data: Any, parent_key: str = "") -> Any:
+        """Redact arbitrary python data structure in-place / copy."""
+        if isinstance(data, dict):
+            redacted_dict: dict[str, Any] = {}
+            for k, v in data.items():
+                k_lower = str(k).lower()
+                if ALWAYS_MASK_KEY_REGEX.search(k_lower):
+                    self.redaction_count += 1
+                    if isinstance(v, str):
+                        redacted_dict[k] = f"<str:{len(v)}>"
+                    elif isinstance(v, (int, float)) and not isinstance(v, bool):
+                        redacted_dict[k] = "<num>"
+                    elif isinstance(v, dict):
+                        redacted_dict[k] = self.redact(v, parent_key=k)
+                    elif isinstance(v, list):
+                        redacted_dict[k] = self.redact(v, parent_key=k)
+                    else:
+                        redacted_dict[k] = "<masked>"
+                else:
+                    redacted_dict[k] = self.redact(v, parent_key=k)
+            return redacted_dict
+
+        if isinstance(data, list):
+            return [self.redact(item, parent_key=parent_key) for item in data]
+
+        if isinstance(data, str):
+            k_lower = parent_key.lower()
+            if self.is_sensitive_value(data):
+                self.redaction_count += 1
+                return f"<str:{len(data)}>"
+            if k_lower in SAFE_KEYS and not ALWAYS_MASK_KEY_REGEX.search(k_lower):
+                return data
+            self.redaction_count += 1
+            return f"<str:{len(data)}>"
+
+        if isinstance(data, (int, float)) and not isinstance(data, bool):
+            k_lower = parent_key.lower()
+            if BALANCE_KEY_REGEX.search(k_lower):
+                self.redaction_count += 1
+                return "<num>"
+            if k_lower in SAFE_KEYS and not ALWAYS_MASK_KEY_REGEX.search(k_lower):
+                return data
+            self.redaction_count += 1
+            return "<num>"
+
+        return data
+
+
+def classify_category_from_keys(keys: set[str]) -> str:
+    """Determine message category based on explicit key names."""
+    lower_keys = {k.lower() for k in keys}
+    for cat in ["balance", "trade/order", "payout", "price", "assets"]:
+        if any(ck in lower_keys for ck in CATEGORY_KEYS[cat]):
+            return cat
+    return "other"
+
+
+def extract_all_keys(data: Any) -> set[str]:
+    """Recursively collect all dictionary keys in a JSON structure."""
+    keys: set[str] = set()
+    if isinstance(data, dict):
+        for k, v in data.items():
+            keys.add(str(k))
+            keys.update(extract_all_keys(v))
+    elif isinstance(data, list):
+        for item in data:
+            keys.update(extract_all_keys(item))
+    return keys
+
+
+def extract_message_type(data: Any) -> str:
+    """Identify message type from common discriminator keys or first key."""
+    if isinstance(data, dict):
+        for candidate in ["type", "event", "action", "cmd", "topic", "e"]:
+            val = data.get(candidate)
+            if val is not None and isinstance(val, (str, int)):
+                return str(val)
+        if data:
+            return str(list(data.keys())[0])
+    elif isinstance(data, list) and data:
+        return extract_message_type(data[0])
+    return "unknown"
+
+
+# ── Main Discovery Class ──────────────────────────────────────────────────────
 
 class PlatformDiscovery:
-    """Read-only platform inspector using Playwright persistent browser context."""
+    """Strictly read-only platform inspector using Playwright."""
 
-    def __init__(self, target_url: str, duration_seconds: int = 60):
+    def __init__(self, target_url: str, duration_seconds: int = 900) -> None:
         self.target_url = target_url
         self.duration_seconds = duration_seconds
-        self.http_traffic: list[dict[str, Any]] = []
-        self.ws_traffic: list[dict[str, Any]] = []
-        self.price_candidates: list[dict[str, Any]] = []
-        self.asset_candidates: list[dict[str, Any]] = []
-        self.balance_candidates: list[dict[str, Any]] = []
-        self.payout_candidates: list[dict[str, Any]] = []
+        self.redactor = PayloadRedactor()
 
-    def _on_response(self, response: Response) -> None:
-        """Analyze HTTP responses for relevant trading market data."""
-        url = response.url
+        # Listeners & Traffic Tracking
+        self._attached_pages: set[Any] = set()
+        self.ws_endpoints: set[str] = set()
+        self.http_endpoints: set[str] = set()
+
+        # Binary frames tracking: count, length, first 16 bytes as hex
+        self.binary_frame_count: int = 0
+        self.binary_samples: list[dict[str, Any]] = []
+
+        # Message type classification: type -> {count, category, example}
+        self.classified_types: dict[str, dict[str, Any]] = {}
+
+    def strip_url(self, raw_url: str) -> str:
+        """Strip query parameters and fragments from URL."""
+        return raw_url.split("?")[0].split("#")[0]
+
+    def _process_text_frame(self, raw_text: str, source_label: str, clean_url: str) -> None:
+        """Parse, redact, and classify a WebSocket or HTTP text payload."""
+        # Attempt to parse as JSON
+        try:
+            data = json.loads(raw_text)
+        except Exception:
+            # Non-JSON payload: mask length
+            self.redactor.redaction_count += 1
+            data = {"raw_text": f"<str:{len(raw_text)}>"}
+
+        # Collect keys before redaction for classification
+        keys = extract_all_keys(data)
+        category = classify_category_from_keys(keys)
+        msg_type = extract_message_type(data)
+
+        # Apply redaction
+        redacted_data = self.redactor.redact(data)
+
+        if msg_type not in self.classified_types:
+            self.classified_types[msg_type] = {
+                "count": 1,
+                "category": category,
+                "example": redacted_data,
+                "source": source_label,
+            }
+        else:
+            self.classified_types[msg_type]["count"] += 1
+
+    def _on_response(self, response: Any) -> None:
+        """Analyze HTTP responses read-only; never records request headers/bodies/cookies."""
+        clean_url = self.strip_url(response.url)
+        self.http_endpoints.add(clean_url)
+
+        # Skip all bodies for auth/login/token/password URLs
+        if SKIP_URL_REGEX.search(clean_url):
+            self.redactor.redaction_count += 1
+            return
+
         content_type = response.headers.get("content-type", "")
         if "json" in content_type:
             try:
-                data = response.json()
-                data_str = json.dumps(data)
-                self._classify_payload("HTTP", url, data_str)
-                self.http_traffic.append({"url": url, "status": response.status})
+                body_text = response.text()
+                self._process_text_frame(body_text, "HTTP_RESP", clean_url)
             except Exception:
                 pass
 
-    def _on_websocket(self, ws: WebSocket) -> None:
-        """Listen to incoming and outgoing WebSocket frames."""
-        ws_url = ws.url
+    def _on_websocket(self, ws: Any) -> None:
+        """Handle text and binary WebSocket frames."""
+        clean_url = self.strip_url(ws.url)
+        parsed = urllib.parse.urlparse(clean_url)
+        clean_endpoint = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+        self.ws_endpoints.add(clean_endpoint)
 
-        def on_frame_received(payload: str) -> None:
-            self._classify_payload("WS_IN", ws_url, payload)
-            if len(self.ws_traffic) < 500:
-                self.ws_traffic.append({"url": ws_url, "direction": "in", "sample": payload[:200]})
+        def on_frame_received(payload: Any) -> None:
+            if isinstance(payload, bytes):
+                self.binary_frame_count += 1
+                if len(self.binary_samples) < 5:
+                    self.binary_samples.append({
+                        "direction": "in",
+                        "len": len(payload),
+                        "hex_prefix": payload[:16].hex(),
+                    })
+            elif isinstance(payload, str):
+                self._process_text_frame(payload, "WS_IN", clean_url)
 
-        def on_frame_sent(payload: str) -> None:
-            if len(self.ws_traffic) < 500:
-                self.ws_traffic.append({"url": ws_url, "direction": "out", "sample": payload[:200]})
+        def on_frame_sent(payload: Any) -> None:
+            if isinstance(payload, bytes):
+                self.binary_frame_count += 1
+                if len(self.binary_samples) < 5:
+                    self.binary_samples.append({
+                        "direction": "out",
+                        "len": len(payload),
+                        "hex_prefix": payload[:16].hex(),
+                    })
+            elif isinstance(payload, str):
+                self._process_text_frame(payload, "WS_OUT", clean_url)
 
         ws.on("framereceived", on_frame_received)
         ws.on("framesent", on_frame_sent)
 
-    def _classify_payload(self, source_type: str, source_url: str, text: str) -> None:
-        """Classify if payload carries prices, assets, payouts, or balance."""
-        lower = text.lower()
+    def _attach_page_listeners(self, page: Any) -> None:
+        """Attach listeners to a page, popup, or newly opened tab."""
+        if page in self._attached_pages:
+            return
+        self._attached_pages.add(page)
+        page.on("response", self._on_response)
+        page.on("websocket", self._on_websocket)
 
-        # Balance indicators
-        if any(kw in lower for kw in ["balance", "account_balance", "real_balance", "demo_balance"]):
-            self.balance_candidates.append(
-                {"source": source_type, "url": source_url, "sample": text[:300]}
-            )
-
-        # Asset / Universe indicators
-        if any(kw in lower for kw in ["assets", "instruments", "actives", "pair", "currency"]):
-            if any(pair in text for pair in ["EUR", "USD", "GBP", "JPY", "BTC"]):
-                self.asset_candidates.append(
-                    {"source": source_type, "url": source_url, "sample": text[:300]}
-                )
-
-        # Payout indicators
-        if any(kw in lower for kw in ["payout", "profit", "percent", "rate", "yield"]):
-            self.payout_candidates.append(
-                {"source": source_type, "url": source_url, "sample": text[:300]}
-            )
-
-        # Price / candle / tick indicators
-        if any(kw in lower for kw in ["quote", "tick", "candle", "ohlc", "bid", "ask", "price"]):
-            self.price_candidates.append(
-                {"source": source_type, "url": source_url, "sample": text[:300]}
-            )
-
-    def run(self) -> None:
-        """Launch browser, wait for user login, collect traffic, and write report."""
-        PROFILE_DIR.mkdir(parents=True, exist_ok=True)
-        print("=" * 60)
-        print("PLATFORM DISCOVERY TOOL (READ-ONLY)")
-        print("Safety Rule: This tool NEVER clicks any trade button.")
-        print(f"Profile directory: {PROFILE_DIR.resolve()}")
-        print(f"Target URL: {self.target_url}")
-        print("=" * 60)
-
-        with sync_playwright() as p:
-            context = p.chromium.launch_persistent_context(
-                user_data_dir=str(PROFILE_DIR.resolve()),
-                headless=False,
-                viewport={"width": 1280, "height": 800},
-            )
-
-            page = context.new_page() if not context.pages else context.pages[0]
-            page.on("response", self._on_response)
-            page.on("websocket", self._on_websocket)
-
-            print(f"Navigating to {self.target_url}...")
-            try:
-                page.goto(self.target_url, timeout=30000)
-            except Exception as e:
-                print(f"Navigation note: {e}")
-
-            print("\nPlease log in to the platform manually in the browser window.")
-            print("Listening for traffic and page elements...")
-            print(f"Will collect data for {self.duration_seconds} seconds.")
-
-            start = time.time()
-            try:
-                while time.time() - start < self.duration_seconds:
-                    time.sleep(1)
-            except KeyboardInterrupt:
-                print("\nMonitoring stopped by user.")
-
-            print("\nCollecting DOM element snapshots...")
-            dom_data = self._inspect_page_elements(page)
-
-            print("Closing browser context...")
-            context.close()
-
-        print(f"Generating report: {REPORT_PATH}...")
-        self._write_report(dom_data)
-        print(f"Discovery report generated successfully at {REPORT_PATH.resolve()}")
-
-    def _inspect_page_elements(self, page) -> dict[str, Any]:
-        """Read-only inspection of potential DOM elements."""
-        info: dict[str, Any] = {"title": page.title(), "url": page.url, "elements_found": []}
-        # Look for typical trading element classes/testids without interacting
+    def _inspect_page_elements(self, page: Any) -> dict[str, Any]:
+        """Read-only inspection of potential DOM elements without any interaction."""
+        info: dict[str, Any] = {"title": page.title(), "url": self.strip_url(page.url), "elements_found": []}
         test_selectors = [
             "[class*='balance']",
             "[data-test*='balance']",
@@ -162,72 +296,176 @@ class PlatformDiscovery:
             try:
                 matches = page.query_selector_all(sel)
                 if matches:
-                    info["elements_found"].append(
-                        {
-                            "selector": sel,
-                            "count": len(matches),
-                            "text_sample": matches[0].inner_text()[:100] if matches else "",
-                        }
-                    )
+                    info["elements_found"].append({
+                        "selector": sel,
+                        "count": len(matches),
+                        "text_sample": matches[0].inner_text()[:100] if matches else "",
+                    })
             except Exception:
                 pass
         return info
 
-    def _write_report(self, dom_data: dict[str, Any]) -> None:
-        """Write findings to discovery_report.md."""
+    def write_report(self, dom_data: Optional[dict[str, Any]] = None) -> None:
+        """Compile and write discovery_report.md."""
         now = datetime.now(timezone.utc).isoformat()
+        dom = dom_data or {"title": "N/A", "url": "N/A", "elements_found": []}
+
+        # Group classified types by category
+        categories = ["price", "assets", "payout", "balance", "trade/order", "other"]
+        grouped: dict[str, list[tuple[str, dict[str, Any]]]] = {c: [] for c in categories}
+        for msg_type, info in sorted(self.classified_types.items()):
+            cat = info.get("category", "other")
+            if cat not in grouped:
+                cat = "other"
+            grouped[cat].append((msg_type, info))
+
+        def format_section(cat_name: str, items: list[tuple[str, dict[str, Any]]]) -> str:
+            lines = [f"### {cat_name.title()} Messages ({len(items)} types captured)"]
+            if not items:
+                lines.append("_No messages captured in this category during monitoring window._\n")
+                return "\n".join(lines)
+            for m_type, details in items:
+                lines.append(f"- **Type**: `{m_type}` (Count: {details['count']})")
+                lines.append("```json")
+                lines.append(json.dumps(details["example"], indent=2))
+                lines.append("```")
+            lines.append("")
+            return "\n".join(lines)
+
         content = f"""# Platform Discovery Report
 
-Generated at: {now}
-Target URL: {self.target_url}
-Monitoring Duration: {self.duration_seconds}s
+> [!WARNING]
+> ## REVIEW BEFORE SHARING
+> Please review this report before sharing externally to verify that no sensitive
+> credentials, account IDs, or unintended tokens are present.
+
+- **Generated At**: {now}
+- **Target URL**: {self.strip_url(self.target_url)}
+- **Monitoring Duration**: {self.duration_seconds}s
+- **Total Redactions Applied**: {self.redactor.redaction_count}
+- **Binary Frames Count**: {self.binary_frame_count}
 
 ## 1. Safety Compliance
-- **Read-Only Mode**: Confirmed. Zero clicks executed on any trading or order buttons.
-- **Credential Safety**: User credentials entered manually in persistent Chromium profile; no credentials stored in code or config.
+- **Read-Only Mode**: Confirmed. Zero clicks, fills, types, presses, checks, or evaluates executed.
+- **Credential Safety**: User credentials entered manually in persistent Chromium profile; no request bodies, headers, or cookies stored.
+- **URL Sanitation**: All query strings stripped; auth/login endpoints skipped.
 
-## 2. WebSocket Traffic Summary
-- Total recorded frames: {len(self.ws_traffic)}
-- Potential Price/Tick Frames: {len(self.price_candidates)}
-- Potential Asset List Frames: {len(self.asset_candidates)}
-- Potential Payout Frames: {len(self.payout_candidates)}
-- Potential Balance Frames: {len(self.balance_candidates)}
+## 2. WebSocket Endpoints
+{chr(10).join(f"- `{ep}`" for ep in sorted(self.ws_endpoints)) if self.ws_endpoints else "- _No WebSocket endpoints recorded._"}
 
-### Sample Price Message
+## 3. Binary Frames Summary
+- Total binary frames: {self.binary_frame_count}
 ```json
-{json.dumps(self.price_candidates[:2], indent=2) if self.price_candidates else "No direct match captured during window"}
+{json.dumps(self.binary_samples, indent=2)}
 ```
 
-### Sample Balance Message
-```json
-{json.dumps(self.balance_candidates[:2], indent=2) if self.balance_candidates else "No direct match captured during window"}
-```
+## 4. Message Classification & Redacted Samples
 
-## 3. HTTP Traffic Summary
-- Total recorded HTTP endpoints: {len(self.http_traffic)}
+{format_section("Price / Candle / Tick", grouped["price"])}
+{format_section("Asset / Instrument List", grouped["assets"])}
+{format_section("Payout / Yield", grouped["payout"])}
+{format_section("Balance / Account", grouped["balance"])}
+{format_section("Order / Trade / Position", grouped["trade/order"])}
+{format_section("Unknown / Other", grouped["other"])}
 
-## 4. DOM Elements Identified (Read-Only)
-- Page Title: {dom_data.get('title', 'N/A')}
-- Current URL: {dom_data.get('url', 'N/A')}
+## 5. HTTP Endpoints Sample (Top 30, Query Strings Stripped)
+{chr(10).join(f"- `{ep}`" for ep in sorted(list(self.http_endpoints))[:30]) if self.http_endpoints else "- _No HTTP endpoints recorded._"}
+
+## 6. DOM Elements Identified (Read-Only)
+- Page Title: {dom.get('title', 'N/A')}
+- Current URL: {dom.get('url', 'N/A')}
 - Identified Selectors:
 ```json
-{json.dumps(dom_data.get('elements_found', []), indent=2)}
+{json.dumps(dom.get('elements_found', []), indent=2)}
 ```
-
-## 5. Adapter Implementation Notes (For Phase 10)
-- Price feed: WebSocket stream inspection
-- Balance feed: WebSocket stream / DOM element
-- Assets & Payouts: HTTP initial state or WebSocket message
-- Trade action elements: To be wired in Phase 10 demo testing
 """
         with open(REPORT_PATH, "w", encoding="utf-8") as fh:
             fh.write(content)
 
+    def run(self) -> None:
+        """Launch browser, attach context-level listeners, monitor traffic, and write report."""
+        from playwright.sync_api import sync_playwright
 
-def main():
-    parser = argparse.ArgumentParser(description="Read-only platform discovery tool")
-    parser.add_argument("--url", default="https://example.com", help="Platform URL")
-    parser.add_argument("--duration", type=int, default=30, help="Monitoring duration in seconds")
+        PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+        print("=" * 80)
+        print("PLATFORM DISCOVERY TOOL (STRICTLY READ-ONLY)")
+        print("Safety Rule: NEVER clicks, fills, types, presses, checks, or evaluates.")
+        print(f"Profile directory: {PROFILE_DIR.resolve()}")
+        print(f"Target URL: {self.strip_url(self.target_url)}")
+        print("=" * 80)
+
+        print("\nCHECKLIST FOR PLATFORM DISCOVERY:")
+        print("  1. Log in manually in the browser window.")
+        print("  2. Switch to the DEMO account.")
+        print("  3. Open the trading screen.")
+        print("  4. Open EUR/USD and two other assets.")
+        print("  5. Open the asset list / instrument selector.")
+        print("  6. Change the chart timeframe (e.g., 1m, 5m).")
+        print("  7. Keep a chart open so real-time price ticks stream in.")
+        print("  8. [OPTIONAL] Place ONE minimum-size trade by hand on DEMO account")
+        print("     so order/trade messages are captured.")
+        print("=" * 80 + "\n")
+
+        dom_data: dict[str, Any] = {}
+        with sync_playwright() as p:
+            context = p.chromium.launch_persistent_context(
+                user_data_dir=str(PROFILE_DIR.resolve()),
+                headless=False,
+                viewport={"width": 1280, "height": 800},
+            )
+
+            # Listeners at context level: handle all new pages, popups, and existing tabs
+            context.on("page", lambda new_page: self._attach_page_listeners(new_page))
+            for pg in context.pages:
+                self._attach_page_listeners(pg)
+
+            page = context.pages[0] if context.pages else context.new_page()
+            self._attach_page_listeners(page)
+
+            print(f"Navigating to {self.target_url}...")
+            try:
+                page.goto(self.target_url, timeout=30000)
+            except Exception as e:
+                print(f"Navigation notice: {e}")
+
+            print(f"Monitoring network and WebSocket traffic for {self.duration_seconds}s (Press Ctrl+C to finish early)...")
+
+            start = time.time()
+            last_reminder = start
+            try:
+                while time.time() - start < self.duration_seconds:
+                    time.sleep(1)
+                    now_t = time.time()
+                    if now_t - last_reminder >= 120:
+                        elapsed_min = int((now_t - start) // 60)
+                        print(f"[{datetime.now(timezone.utc).strftime('%H:%M:%S')}] Reminder ({elapsed_min}m elapsed):")
+                        print("  - Ensure you are on DEMO account")
+                        print("  - View asset list & switch assets")
+                        print("  - Change chart timeframe")
+                        print("  - Keep a chart open for ticks")
+                        last_reminder = now_t
+            except KeyboardInterrupt:
+                print("\nMonitoring stopped early by user (Ctrl+C). Saving captured data...")
+
+            try:
+                dom_data = self._inspect_page_elements(page)
+            except Exception as e:
+                print(f"DOM inspection note: {e}")
+
+            try:
+                context.close()
+            except Exception:
+                pass
+
+        print(f"Generating report: {REPORT_PATH}...")
+        self.write_report(dom_data)
+        print(f"Report generated successfully at {REPORT_PATH.resolve()}")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Strictly read-only platform discovery tool")
+    parser.add_argument("--url", required=True, help="Target platform URL (required)")
+    parser.add_argument("--duration", type=int, default=900, help="Monitoring duration in seconds (default: 900)")
     args = parser.parse_args()
 
     discovery = PlatformDiscovery(target_url=args.url, duration_seconds=args.duration)

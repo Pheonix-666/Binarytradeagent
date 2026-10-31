@@ -11,6 +11,7 @@ PROJECT_SPEC.md Section 1, 6, 9 & Phase 9:
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import json
 import logging
@@ -27,6 +28,7 @@ from analysis.candidates import CandidateEvaluationResult, CandidateTrade, build
 from core.clock import Clock, RealClock
 from core.config import AppConfig
 from core.models import TradeDirection
+from backtest.engine import Fast1mLookup
 from data.price_source import PriceSource
 from data.store import DataStore, TradeRecord, TradeRepository
 from decision.schema import ValidatedDecision
@@ -34,15 +36,33 @@ from execution.reconcile import reconcile_startup
 from execution.state import StateManager
 from execution.trade_manager import ExecutionResult, TradeManager
 from orchestrator.fresh_inputs import build_account_snapshot
-from orchestrator.paper_entry import PaperEntryModel
+from orchestrator.paper_entry import PaperEntryModel, calculate_entry_price
 from orchestrator.reports import generate_daily_summary_markdown
 from orchestrator.telegram_worker import TelegramWorker
+from risk.stake import policy_stake_amount
 from safety.breaker import CircuitBreaker
 from safety.killswitch import KillSwitch
 from selection.asset_selector import SelectedAsset, select_top_assets
 from selection.stats import AssetStats, compute_asset_stats
 
 logger = logging.getLogger("trading_system.orchestrator")
+
+
+@dataclass
+class HeldOrder:
+    """An approved order waiting for entry_time execution with full fidelity."""
+
+    decision: ValidatedDecision
+    candidate: Any
+    account: Any
+    adaptive_state: Any
+    decision_time: datetime
+    entry_time: datetime
+    asset: str
+    direction: TradeDirection
+    expiry_minutes: int
+    atr: Optional[float]
+    payout: float
 
 
 def compute_warmup_bars(config: AppConfig) -> dict[str, int]:
@@ -114,6 +134,7 @@ class Orchestrator:
         self.record_only_assets: set[str] = set()
         self.warmup_bars = compute_warmup_bars(self.config)
         self.consecutive_source_failures: int = 0
+        self.held_orders: list[HeldOrder] = []
 
         # Reports directory
         reports_dir_str = getattr(config.orchestrator, "reports_dir", "reports/daily") if hasattr(config, "orchestrator") else "reports/daily"
@@ -230,6 +251,9 @@ class Orchestrator:
         if self.paper_adapter and hasattr(self.paper_adapter, "set_current_time"):
             self.paper_adapter.set_current_time(cur_time)
 
+        # Process any pending held orders before settlement
+        self.process_held_orders(cur_time)
+
         quotes = self.source.get_assets()
         prices_map = {}
         for q in quotes:
@@ -237,6 +261,17 @@ class Orchestrator:
             candles = self.source.get_candles(q.asset_id, "1m", 1)
             if not candles.empty:
                 prices_map[q.asset_id] = float(candles.iloc[-1]["close"])
+
+        # For replay source, ensure parity with backtest exit price
+        if hasattr(self.source, "_load_raw_1m") and self.paper_adapter:
+            open_trades = getattr(self.paper_adapter, "_open_trades", [])
+            for tr in open_trades:
+                exp_t = tr.entry_time + timedelta(minutes=tr.expiry_minutes)
+                if cur_time >= exp_t:
+                    df_1m = self.source._load_raw_1m(tr.asset_id)
+                    exit_bar = Fast1mLookup(df_1m).get_bar(exp_t)
+                    if exit_bar is not None:
+                        prices_map[tr.asset_id] = float(exit_bar["close"])
 
         settled = self.trade_manager.settle_shadow_trades(
             now=cur_time,
@@ -254,6 +289,118 @@ class Orchestrator:
                     self.adaptive_controller.on_trade_settled(res_val, payout, now=cur_time)
 
         return settled
+
+    def process_held_orders(self, cur_time: datetime) -> list[ExecutionResult]:
+        """Process and execute held orders that have reached their scheduled entry_time."""
+        remaining: list[HeldOrder] = []
+        executed_results: list[ExecutionResult] = []
+
+        for held in self.held_orders:
+            if cur_time >= held.entry_time:
+                res = self._execute_held_order(held, execution_time=held.entry_time)
+                if res:
+                    executed_results.append(res)
+            else:
+                remaining.append(held)
+
+        self.held_orders = remaining
+        return executed_results
+
+    def _execute_held_order(self, held: HeldOrder, execution_time: Optional[datetime] = None) -> Optional[ExecutionResult]:
+        """Execute a held order at its entry_time with full entry fidelity and staleness re-checks."""
+        exec_t = execution_time or held.entry_time
+
+        # 1. Breaker & Killswitch check
+        if self.breaker.is_tripped() or self.kill_switch.is_active():
+            logger.warning("Breaker or kill switch tripped at entry_time %s for %s", exec_t.isoformat(), held.asset)
+            self._log_cycle_record({
+                "timestamp": exec_t.isoformat(),
+                "asset": held.asset,
+                "action": "BLOCKED",
+                "reason": "Breaker or killswitch tripped at entry_time",
+                "payout": held.payout,
+            })
+            return None
+
+        # 2. Staleness re-check and entry price lookup
+        open_price: Optional[float] = None
+        if hasattr(self.source, "_load_raw_1m"):
+            # Replay source: open of the 1m bar at entry_time (parity with backtest)
+            df_1m = self.source._load_raw_1m(held.asset)
+            lookup = Fast1mLookup(df_1m)
+            bar = lookup.get_bar(held.entry_time)
+            if bar is None:
+                logger.warning("Data gap at entry_time %s for %s; skipping held order", held.entry_time.isoformat(), held.asset)
+                self._log_cycle_record({
+                    "timestamp": exec_t.isoformat(),
+                    "asset": held.asset,
+                    "action": "SKIP",
+                    "reason": "data_gap_entry (staleness check failed)",
+                    "payout": held.payout,
+                })
+                return None
+            open_price = float(bar["open"])
+        else:
+            # Live/mock source
+            candles_1m = self.source.get_candles(held.asset, "1m", 1)
+            if candles_1m.empty:
+                logger.warning("No candle data for %s at entry_time %s", held.asset, exec_t.isoformat())
+                return None
+            latest_ts_close = candles_1m.iloc[-1]["ts_close"]
+            if not self.breaker.check_data_freshness(data_time=latest_ts_close, now=exec_t):
+                logger.warning("Data staleness check failed at entry_time %s for %s", exec_t.isoformat(), held.asset)
+                self._log_cycle_record({
+                    "timestamp": exec_t.isoformat(),
+                    "asset": held.asset,
+                    "action": "SKIP",
+                    "reason": "Data freshness check failed at entry_time",
+                    "payout": held.payout,
+                })
+                return None
+            open_price = float(candles_1m.iloc[-1]["close"])
+
+        slippage_atr = (
+            getattr(self.config.execution_model, "slippage_atr", None)
+            if hasattr(self.config, "execution_model")
+            else getattr(self.config.paper, "slippage_atr", 0.02)
+        )
+        if slippage_atr is None:
+            slippage_atr = 0.02
+
+        entry_price = calculate_entry_price(
+            open_price=open_price,
+            direction=held.direction,
+            atr=held.atr,
+            slippage_atr=slippage_atr,
+        )
+
+        # 3. Synchronize paper adapter price and time
+        if self.paper_adapter and hasattr(self.paper_adapter, "set_current_time"):
+            self.paper_adapter.set_current_time(held.entry_time)
+        if self.paper_adapter and hasattr(self.paper_adapter, "set_price"):
+            self.paper_adapter.set_price(held.asset, entry_price)
+
+        # 4. Execute through TradeManager
+        exec_res = self.trade_manager.execute(
+            decision=held.decision,
+            account=held.account,
+            adaptive_state=held.adaptive_state,
+            now=held.entry_time,
+        )
+
+        self._log_cycle_record({
+            "timestamp": held.entry_time.isoformat(),
+            "asset": held.asset,
+            "action": "TRADE" if exec_res.executed else "BLOCKED",
+            "status": exec_res.status,
+            "direction": held.decision.direction,
+            "stake": held.decision.stake_amount,
+            "trade_id": exec_res.trade_id,
+            "entry_price": entry_price,
+            "reason": exec_res.reason,
+            "payout": held.payout,
+        })
+        return exec_res
 
     def run_heartbeat_job(self, cur_time: datetime) -> None:
         """Emit periodic health check to Telegram."""
@@ -322,6 +469,9 @@ class Orchestrator:
 
         logger.info("--- Starting 5m evaluation cycle at %s ---", cur_time.isoformat())
         execution_results: list[ExecutionResult] = []
+
+        # Execute any held orders ready at cycle start
+        execution_results.extend(self.process_held_orders(cur_time))
 
         # 1. Fresh AccountSnapshot
         active_adapter = self.paper_adapter if str(self.config.mode).lower() == "paper" and self.paper_adapter else self.adapter
@@ -499,7 +649,14 @@ class Orchestrator:
 
             # 4. Decision Selection (policy or llm)
             decision_mode = getattr(self.config.paper, "decision_mode", "policy") if hasattr(self.config, "paper") else "policy"
-            decision_result: Optional[DecisionResult] = None
+            decision_result: Optional[ValidatedDecision] = None
+            cand_atr: Optional[float] = None
+
+            adaptive_state = (
+                self.adaptive_controller.state
+                if self.adaptive_controller and hasattr(self.adaptive_controller, "state")
+                else AdaptiveState(tier="NORMAL", stake_scale=1.0, real_trading_allowed=True)
+            )
 
             if decision_mode == "policy":
                 # Deterministic candidate selection: lowest risk score, then lowest DTW distance
@@ -511,29 +668,34 @@ class Orchestrator:
                     ),
                 )
                 best_cand = sorted_cands[0]
+                cand_atr = best_cand.atr
 
-                # Update paper adapter price with current 1m close
-                current_price = float(candles_by_tf["1m"].iloc[-1]["close"])
-                if self.paper_adapter and hasattr(self.paper_adapter, "set_price"):
-                    self.paper_adapter.set_price(asset, current_price)
-
-                # Simulated execution details
                 expiry_min = int(getattr(best_cand, "expiry_minutes", None) or getattr(self.config.trading, "expiry_minutes", 15))
-                exec_details = self.paper_entry_model.calculate_entry(
-                    decision_time=cur_time,
-                    base_price=current_price,
-                    direction=best_cand.direction,
-                    expiry_minutes=expiry_min,
-                    atr=best_cand.atr,
+                dir_str = "CALL" if best_cand.direction == TradeDirection.CALL else "PUT"
+
+                stake_policy = getattr(self.config.paper, "stake_policy", None) or getattr(self.config.backtest, "stake_policy", "max")
+                stake_scale = getattr(adaptive_state, "stake_scale", 1.0)
+                calc_stake = policy_stake_amount(
+                    equity=account.equity,
+                    max_stake_pct=best_cand.max_stake_pct,
+                    stake_policy=stake_policy,
+                    stake_scale=stake_scale,
+                    min_pct=self.config.stake.min_pct,
+                    min_amount=self.config.stake.min_amount,
+                    round_to=self.config.stake.round_to,
+                    max_amount=self.config.stake.max_amount,
                 )
 
-                dir_str = "CALL" if best_cand.direction == TradeDirection.CALL else "PUT"
-                round_to = getattr(self.config.stake, "round_to", 1.0)
-                target_pct = (self.config.stake.min_pct + self.config.stake.max_pct) / 2.0
-                calc_stake = math.floor((account.equity * (target_pct / 100.0)) / round_to) * round_to
-                calc_stake = max(self.config.stake.min_amount, calc_stake)
-                if self.config.stake.max_amount:
-                    calc_stake = min(self.config.stake.max_amount, calc_stake)
+                if calc_stake is None:
+                    self._log_cycle_record({
+                        "timestamp": cur_time.isoformat(),
+                        "asset": asset,
+                        "action": "SKIP",
+                        "reason": "stake below min_amount",
+                        "candidates_count": len(cand_res.candidates),
+                        "payout": payout,
+                    })
+                    continue
 
                 decision_result = ValidatedDecision(
                     decision=dir_str,
@@ -570,6 +732,8 @@ class Orchestrator:
                             "payout": payout,
                         })
                         continue
+                if decision_result and getattr(decision_result, "evidence", None):
+                    cand_atr = getattr(decision_result.evidence, "atr", None)
 
             if not decision_result or decision_result.decision == "SKIP":
                 self._log_cycle_record({
@@ -582,31 +746,46 @@ class Orchestrator:
                 })
                 continue
 
-            # 5. Order execution via TradeManager
-            adaptive_state = (
-                self.adaptive_controller.state
-                if self.adaptive_controller and hasattr(self.adaptive_controller, "state")
-                else AdaptiveState(tier="NORMAL", stake_scale=1.0, real_trading_allowed=True)
+            # 5. Order execution with Entry Fidelity
+            entry_delay_bars = (
+                getattr(self.config.execution_model, "entry_delay_bars", None)
+                if hasattr(self.config, "execution_model")
+                else getattr(self.config.paper, "entry_delay_bars", 1)
             )
-            exec_res = self.trade_manager.execute(
+            if entry_delay_bars is None:
+                entry_delay_bars = 1
+
+            entry_time = cur_time + timedelta(minutes=entry_delay_bars)
+            held = HeldOrder(
                 decision=decision_result,
+                candidate=best_cand if decision_mode == "policy" else None,
                 account=account,
                 adaptive_state=adaptive_state,
-                now=cur_time,
+                decision_time=cur_time,
+                entry_time=entry_time,
+                asset=asset,
+                direction=TradeDirection(decision_result.direction),
+                expiry_minutes=int(decision_result.expiry_minutes or 15),
+                atr=cand_atr,
+                payout=float(decision_result.payout or payout or 0.85),
             )
-            execution_results.append(exec_res)
 
-            self._log_cycle_record({
-                "timestamp": cur_time.isoformat(),
-                "asset": asset,
-                "action": "TRADE" if exec_res.executed else "BLOCKED",
-                "status": exec_res.status,
-                "direction": decision_result.direction,
-                "stake": decision_result.stake_amount,
-                "trade_id": exec_res.trade_id,
-                "reason": exec_res.reason,
-                "payout": payout,
-            })
+            if entry_delay_bars == 0:
+                exec_res = self._execute_held_order(held, execution_time=cur_time)
+                if exec_res:
+                    execution_results.append(exec_res)
+            else:
+                self.held_orders.append(held)
+                self._log_cycle_record({
+                    "timestamp": cur_time.isoformat(),
+                    "asset": asset,
+                    "action": "HELD",
+                    "status": "HELD",
+                    "entry_time": entry_time.isoformat(),
+                    "direction": decision_result.direction,
+                    "stake": decision_result.stake_amount,
+                    "payout": held.payout,
+                })
 
         return execution_results
 

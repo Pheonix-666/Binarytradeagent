@@ -164,8 +164,13 @@ orchestrator:
   max_cycle_duration_seconds: 300
   reports_dir: reports/daily
 
+execution_model:
+  entry_delay_bars: 1
+  slippage_atr: 0.02
+
 paper:
   decision_mode: policy
+  stake_policy: max
   entry_delay_bars: 1
   slippage_atr: 0.02
 

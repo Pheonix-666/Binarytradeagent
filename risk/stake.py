@@ -90,3 +90,41 @@ def stake_amount(
         return None
 
     return float(floored)
+
+
+def policy_stake_amount(
+    equity: float,
+    max_stake_pct: float,
+    stake_policy: str = "max",
+    stake_scale: float = 1.0,
+    min_pct: float = 1.0,
+    min_amount: float = 1.0,
+    round_to: float = 1.0,
+    max_amount: Optional[float] = None,
+) -> Optional[float]:
+    """Calculate policy-mode position stake amount.
+
+    Shared between backtest and paper orchestrator to guarantee sizing parity:
+      - stake_policy == 'max': target_pct = max_stake_pct
+      - stake_policy == 'mid': target_pct = (min_pct + max_stake_pct) / 2.0
+      - stake_policy == 'min': target_pct = min_pct
+      - target_pct = target_pct * stake_scale
+      - stake_amount(equity, target_pct, min_amount, round_to, max_amount)
+    Returns None if stake is below min_amount (meaning SKIP).
+    """
+    target_pct = float(max_stake_pct)
+    policy_str = str(stake_policy).lower()
+    if policy_str == "mid":
+        target_pct = (float(min_pct) + target_pct) / 2.0
+    elif policy_str == "min":
+        target_pct = float(min_pct)
+
+    target_pct = target_pct * max(0.0, float(stake_scale))
+
+    return stake_amount(
+        equity=equity,
+        pct=target_pct,
+        min_amount=min_amount,
+        round_to=round_to,
+        max_amount=max_amount,
+    )

@@ -37,7 +37,7 @@ from decision.llm_client import FakeLLMClient, LLMClient, get_llm_client
 from decision.schema import SystemState
 from decision.service import DecisionService
 from patterns.library import PatternLibrary, get_pattern_library
-from risk.stake import compute_equity, stake_amount
+from risk.stake import compute_equity, policy_stake_amount, stake_amount
 import safety.limits as safety_limits
 from safety.limits import AccountSnapshot, OrderRequest
 from selection.stats import compute_asset_stats, hour_risk
@@ -567,19 +567,14 @@ class BacktestEngine:
                     current_open_stakes = sum(ot.stake for ot in open_trades)
                     equity = compute_equity(cash, current_open_stakes)
 
-                    target_pct = cand.max_stake_pct
-                    if step_cfg.backtest.stake_policy == "mid":
-                        target_pct = (step_cfg.stake.min_pct + target_pct) / 2.0
-                    elif step_cfg.backtest.stake_policy == "min":
-                        target_pct = step_cfg.stake.min_pct
-
-                    # Scale stake by adaptive stake scale
+                    stake_policy = getattr(step_cfg.backtest, "stake_policy", "max")
                     stake_scale = getattr(step_cfg.stake, "stake_scale", 1.0)
-                    target_pct = target_pct * stake_scale
-
-                    stake = stake_amount(
+                    stake = policy_stake_amount(
                         equity=equity,
-                        pct=target_pct,
+                        max_stake_pct=cand.max_stake_pct,
+                        stake_policy=stake_policy,
+                        stake_scale=stake_scale,
+                        min_pct=step_cfg.stake.min_pct,
                         min_amount=step_cfg.stake.min_amount,
                         round_to=step_cfg.stake.round_to,
                         max_amount=step_cfg.stake.max_amount,
