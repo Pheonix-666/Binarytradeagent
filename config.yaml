@@ -143,6 +143,9 @@ safety:
   stake_verification_tolerance: 0.01
   rate_limit_window_minutes: 10
 
+execution:
+  demo_bypasses_paper_gate: false
+
 llm:
   provider: anthropic
   model: claude-sonnet-5-5

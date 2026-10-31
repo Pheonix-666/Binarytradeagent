@@ -199,9 +199,11 @@ class StateManager:
         # Merge updates into self.data
         for k, v in kwargs.items():
             if k == "adaptive_state":
-                self.data["adaptive_state"] = v.to_dict() if hasattr(v, "to_dict") else as_dict_or_raw(v)
+                if v is not None:
+                    self.data["adaptive_state"] = v.to_dict() if hasattr(v, "to_dict") else as_dict_or_raw(v)
             elif k == "breaker_state":
-                self.data["breaker_state"] = as_dict_or_raw(v)
+                if v is not None:
+                    self.data["breaker_state"] = as_dict_or_raw(v)
             elif k in ("open_trades", "pending_trades"):
                 self.data[k] = [_to_json_item(t) for t in (v or [])]
             elif k in ("balance", "equity", "daily_starting_balance", "today_loss"):
@@ -222,6 +224,14 @@ class StateManager:
         self.data["last_updated"] = now_iso
         self.data["schema_version"] = SCHEMA_VERSION
 
+        self._persist_to_disk(self.data)
+        return self.data
+
+    def clear_adaptive_state(self) -> dict[str, Any]:
+        """Explicitly clear adaptive state to None and atomically persist."""
+        self.data["adaptive_state"] = None
+        now_iso = datetime.now(timezone.utc).isoformat()
+        self.data["last_updated"] = now_iso
         self._persist_to_disk(self.data)
         return self.data
 

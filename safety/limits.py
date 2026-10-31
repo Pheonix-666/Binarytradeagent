@@ -154,7 +154,13 @@ def check_order(
     # 3. Asset Mode Check
     if not shadow_only:
         mode = asset_modes.get(asset, "paper")
-        if mode != "live_eligible":
+        exec_cfg = getattr(config, "execution", None)
+        demo_bypass = bool(
+            exec_cfg
+            and getattr(exec_cfg, "demo_bypasses_paper_gate", False)
+            and getattr(config, "mode", "paper") == "demo"
+        )
+        if mode != "live_eligible" and not demo_bypass:
             return Block(
                 f"Asset '{asset}' is in mode '{mode}'; real trading requires 'live_eligible'"
             )

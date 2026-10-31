@@ -29,6 +29,7 @@ logger = logging.getLogger(__name__)
 from adaptive.monitor import AdaptiveState
 from core.config import AppConfig
 from core.models import CanonicalTrade, TradeDirection, TradeReceipt
+from data.store import TradeRecord, TradeRepository
 from decision.schema import ValidatedDecision
 from execution.state import StateManager
 from safety.breaker import CircuitBreaker
@@ -77,9 +78,10 @@ class TradeManager:
         kill_switch: KillSwitch,
         adapter: Any,
         paper_adapter: Optional[Any] = None,
-        db_store: Optional[Any] = None,
+        repository: Optional[Any] = None,
         alerter: Optional[Any] = None,
         alert_throttle_minutes: int = 15,
+        db_store: Optional[Any] = None,
     ):
         self.config = config
         self.state_manager = state_manager
@@ -87,7 +89,7 @@ class TradeManager:
         self.kill_switch = kill_switch
         self.adapter = adapter
         self.paper_adapter = paper_adapter
-        self.db_store = db_store
+        self.repository = repository if repository is not None else db_store
         self.alerter = alerter
         self.reconcile_done: bool = False
         self.alert_throttle_minutes = alert_throttle_minutes
@@ -163,11 +165,8 @@ class TradeManager:
         expected_expiry: int,
         expected_stake: float,
     ) -> int:
-        """Count currently open trades on adapter matching all attributes."""
-        try:
-            trades = list(self.adapter.get_open_trades())
-        except Exception:
-            return 0
+        """Count currently open trades on adapter matching all attributes. Raises if snapshot cannot be read."""
+        trades = list(self.adapter.get_open_trades())
         stake_tol = getattr(self.config.safety, "stake_verification_tolerance", 0.01) if hasattr(self.config, "safety") else 0.01
         count = 0
         for t in trades:
@@ -208,9 +207,12 @@ class TradeManager:
 
         # Fallback: if platform does not return/report matching ID,
         # open trades count must have increased by exactly +1
-        after_count = self._count_matching_open_trades(
-            expected_asset, expected_direction, expected_expiry, expected_stake
-        )
+        try:
+            after_count = self._count_matching_open_trades(
+                expected_asset, expected_direction, expected_expiry, expected_stake
+            )
+        except Exception:
+            return False
         return after_count == before_count + 1
 
     def place_trade(
@@ -284,7 +286,17 @@ class TradeManager:
         # Real orders only in "demo" or "live"; any other/unknown routes to paper
         mode_str = str(getattr(self.config, "mode", "paper")).lower()
         asset_mode = account.asset_modes.get(str(decision.asset), "paper")
-        is_real_candidate = (mode_str in {"demo", "live"}) and (asset_mode == "live_eligible") and not bool(decision.shadow_only)
+        exec_cfg = getattr(self.config, "execution", None)
+        demo_bypass = bool(
+            exec_cfg
+            and getattr(exec_cfg, "demo_bypasses_paper_gate", False)
+            and mode_str == "demo"
+        )
+        is_real_candidate = (
+            (mode_str in {"demo", "live"})
+            and (asset_mode == "live_eligible" or demo_bypass)
+            and not bool(decision.shadow_only)
+        )
 
         # Missing adaptive config is treated as enabled (fail-closed)
         adaptive_cfg = getattr(self.config, "adaptive", None)
@@ -335,7 +347,7 @@ class TradeManager:
             return ExecutionResult(executed=False, status="BLOCKED_SAFETY", reason=msg, executed_at=now_iso)
 
         if is_paper:
-            return self._execute_paper_shadow(order, decision_id=decision_id, now=now_dt)
+            return self._execute_paper_shadow(order, decision_id=decision_id, decision=decision, now=now_dt)
 
         # ── Step 5: Real trade placement with write-ahead logging ─────────────
         # Real orders REQUIRE a decision ID
@@ -380,13 +392,41 @@ class TradeManager:
         # Rolling rate limit check
         if not self.breaker.record_order(now=now_dt):
             msg = f"Order blocked: {self.breaker.trip_reason}"
+            active_pending = [
+                pt for pt in self.state_manager.data.get("pending_trades", [])
+                if pt.get("id") != trade_id
+            ]
+            self.state_manager.update(
+                pending_trades=active_pending,
+                breaker_state=self.breaker.state,
+            )
             self._send_alert_safe(f"⚡ {msg}")
             return ExecutionResult(executed=False, status="BREAKER_TRIPPED", reason=msg, executed_at=now_iso)
 
         # Snapshot open trades count matching order parameters before adapter call
-        before_count = self._count_matching_open_trades(
-            order.asset, order.direction, order.expiry_minutes, order.stake
-        )
+        try:
+            before_count = self._count_matching_open_trades(
+                order.asset, order.direction, order.expiry_minutes, order.stake
+            )
+        except Exception as exc:
+            err_msg = f"Failed to read open-trades snapshot before placement: {exc}"
+            self.breaker.record_exec_error(err_msg, now=now_dt)
+            active_pending = [
+                pt for pt in self.state_manager.data.get("pending_trades", [])
+                if pt.get("id") != trade_id
+            ]
+            self.state_manager.update(
+                pending_trades=active_pending,
+                breaker_state=self.breaker.state,
+            )
+            self._send_alert_safe(f"🚨 {err_msg}")
+            return ExecutionResult(
+                executed=False,
+                status="BLOCKED",
+                trade_id=trade_id,
+                reason=err_msg,
+                executed_at=now_iso,
+            )
 
         # Call broker adapter to place trade (must raise if method is missing)
         placed_receipt: Any = None
@@ -448,6 +488,20 @@ class TradeManager:
             pt for pt in self.state_manager.data.get("pending_trades", [])
             if pt.get("id") != trade_id
         ]
+        raw_payout = getattr(placed_receipt, "payout", None)
+        if raw_payout is None or float(raw_payout) <= 0:
+            err_msg = f"Real order {trade_id} receipt has missing or invalid payout: {raw_payout}"
+            self.breaker.trip(err_msg, now=now_dt)
+            self._send_alert_safe(f"🚨 CRITICAL: {err_msg}")
+            return ExecutionResult(
+                executed=False,
+                status="EXEC_ERROR",
+                trade_id=trade_id,
+                reason=err_msg,
+                executed_at=now_iso,
+            )
+        receipt_payout = float(raw_payout)
+
         open_record = {
             "id": trade_id,
             "platform_trade_id": str(platform_id) if platform_id else trade_id,
@@ -456,7 +510,7 @@ class TradeManager:
             "direction": order.direction,
             "expiry_minutes": order.expiry_minutes,
             "stake": order.stake,
-            "payout": float(getattr(placed_receipt, "payout", 0.85)),
+            "payout": receipt_payout,
             "status": "OPEN",
             "opened_at": now_iso,
         }
@@ -476,13 +530,46 @@ class TradeManager:
         if decision_id:
             self.executed_decision_ids.add(decision_id)
 
-        # Log to SQLite store if configured; alert on DB write failure, never swallow
-        if self.db_store and hasattr(self.db_store, "record_trade"):
+        # Log real trade to TradeRepository; failed write raises alert and trips breaker
+        if self.repository is not None:
+            pattern_name = getattr(decision, "pattern_name", None)
+            pattern_type = getattr(decision, "pattern_type", None)
+            risk_score = getattr(decision, "risk_score", None)
+            if risk_score is None and getattr(decision, "evidence", None):
+                risk_score = getattr(decision.evidence, "risk_score", None)
+            is_otc = getattr(decision, "is_otc", None)
+            if is_otc is None:
+                asset_str = str(order.asset)
+                is_otc = "_otc" in asset_str.lower() or "otc" in asset_str.lower()
+
+            trade_mode = str(getattr(self.config, "mode", "live")).lower()
+            if trade_mode not in ("demo", "live"):
+                trade_mode = "demo"
+
             try:
-                self.db_store.record_trade(open_record)
+                record = TradeRecord(
+                    id=trade_id,
+                    opened_at=now_iso,
+                    asset=order.asset,
+                    is_otc=bool(is_otc),
+                    direction=order.direction,
+                    expiry_minutes=order.expiry_minutes,
+                    stake=order.stake,
+                    payout_at_entry=receipt_payout,
+                    result="PENDING",
+                    pnl=0.0,
+                    mode=trade_mode,
+                    pattern_name=pattern_name,
+                    pattern_type=pattern_type,
+                    risk_score=risk_score,
+                    hour_utc=now_dt.hour,
+                )
+                self.repository.insert(record)
             except Exception as dbe:
-                logger.error("Database write failure: %s", dbe)
-                self._send_alert_safe(f"⚠️ Database write failure: {dbe}")
+                err_msg = f"Database write failure for real trade {trade_id}: {dbe}"
+                logger.error(err_msg)
+                self.breaker.trip(err_msg, now=now_dt)
+                self._send_alert_safe(f"🚨 CRITICAL: {err_msg}")
 
         success_msg = f"Trade placed: {order.asset} {order.direction} ${order.stake:,.2f} ({order.expiry_minutes}m)"
         self._send_alert_safe(f"✅ {success_msg}")
@@ -496,7 +583,7 @@ class TradeManager:
             stake_amount=order.stake,
             entry_price=float(getattr(placed_receipt, "entry_price", 0.0)),
             entry_time=now_dt,
-            payout=float(getattr(placed_receipt, "payout", 0.85)),
+            payout=receipt_payout,
             status="OPEN",
         )
 
@@ -518,6 +605,7 @@ class TradeManager:
         self,
         order: OrderRequest,
         decision_id: Optional[str] = None,
+        decision: Optional[ValidatedDecision] = None,
         now: Optional[datetime] = None,
     ) -> ExecutionResult:
         """Record paper shadow trade using paper_adapter.place_trade."""
@@ -539,6 +627,42 @@ class TradeManager:
 
         if decision_id:
             self.executed_decision_ids.add(decision_id)
+
+        # Log shadow trade to TradeRepository if available
+        if self.repository is not None:
+            pattern_name = getattr(decision, "pattern_name", None)
+            pattern_type = getattr(decision, "pattern_type", None)
+            risk_score = getattr(decision, "risk_score", None)
+            if risk_score is None and decision and getattr(decision, "evidence", None):
+                risk_score = getattr(decision.evidence, "risk_score", None)
+            is_otc = getattr(decision, "is_otc", None)
+            if is_otc is None:
+                asset_str = str(order.asset)
+                is_otc = "_otc" in asset_str.lower() or "otc" in asset_str.lower()
+            shadow_payout = float(getattr(receipt, "payout", None) or 0.85)
+
+            try:
+                record = TradeRecord(
+                    id=trade_id,
+                    opened_at=now_iso,
+                    asset=order.asset,
+                    is_otc=bool(is_otc),
+                    direction=order.direction,
+                    expiry_minutes=order.expiry_minutes,
+                    stake=order.stake,
+                    payout_at_entry=shadow_payout,
+                    result="PENDING",
+                    pnl=0.0,
+                    mode="paper",
+                    pattern_name=pattern_name,
+                    pattern_type=pattern_type,
+                    risk_score=risk_score,
+                    hour_utc=now_dt.hour,
+                )
+                self.repository.insert(record)
+            except Exception as dbe:
+                logger.error("Database write failure for shadow trade %s: %s", trade_id, dbe)
+                self._send_alert_safe(f"⚠️ Database write failure for shadow trade: {dbe}")
 
         msg = f"Shadow paper trade recorded: {order.asset} {order.direction} ${order.stake:,.2f} ({order.expiry_minutes}m)"
         self._send_alert_safe(f"📝 {msg}")
@@ -577,12 +701,21 @@ class TradeManager:
             else:
                 remaining_open.append(ot)
 
-        stake = float(target_trade.get("stake", 0.0)) if target_trade else 0.0
+        if target_trade is None:
+            err_msg = f"Settlement failed: trade ID '{trade_id}' not found in open trades"
+            self._send_alert_safe(f"🚨 {err_msg}")
+            raise KeyError(err_msg)
+
+        stake = float(target_trade.get("stake", 0.0))
         # Use payout stored in trade record at entry if available
-        if target_trade and "payout" in target_trade:
+        if "payout" in target_trade and target_trade["payout"] is not None:
             entry_payout = float(target_trade["payout"])
+        elif payout is not None:
+            entry_payout = float(payout)
         else:
-            entry_payout = float(payout if payout is not None else 0.85)
+            err_msg = f"Settlement failed for trade {trade_id}: no payout available in trade record or settlement call"
+            self._send_alert_safe(f"🚨 {err_msg}")
+            raise ValueError(err_msg)
 
         norm_outcome = str(outcome).upper().strip()
         if norm_outcome == "WIN":
@@ -622,9 +755,66 @@ class TradeManager:
             breaker_state=self.breaker.state,
             reconcile_done=self.reconcile_done,
         )
+
+        if self.repository is not None:
+            try:
+                self.repository.update_result(
+                    trade_id=str(trade_id),
+                    closed_at=now_dt.isoformat(),
+                    result=norm_outcome,
+                    pnl=profit,
+                )
+            except Exception as dbe:
+                err_msg = f"Database update failure on settlement for real trade {trade_id}: {dbe}"
+                logger.error(err_msg)
+                self.breaker.trip(err_msg, now=now_dt)
+                self._send_alert_safe(f"🚨 CRITICAL: {err_msg}")
+
         return {
             "trade_id": trade_id,
             "outcome": norm_outcome,
             "balance": new_balance,
             "profit": profit,
         }
+
+    def settle_shadow_trades(
+        self,
+        now: Optional[datetime] = None,
+        prices_at_expiry: Optional[dict[str, float]] = None,
+    ) -> list[Any]:
+        """Settle open shadow trades on paper_adapter and update the TradeRepository."""
+        if self.paper_adapter is None:
+            return []
+        now_dt = now or datetime.now(timezone.utc)
+        settled = self.paper_adapter.settle_open_trades(
+            current_time=now_dt,
+            prices_at_expiry=prices_at_expiry,
+        )
+        if self.repository is not None:
+            for trade in settled:
+                tid = getattr(trade, "trade_id", getattr(trade, "id", None))
+                res = getattr(trade, "result", None)
+                res_str = res.value if hasattr(res, "value") else str(res)
+                stake = float(getattr(trade, "stake_amount", getattr(trade, "stake", 0.0)))
+                payout_rate = float(getattr(trade, "payout", 0.85) or 0.85)
+                if res_str == "WIN":
+                    pnl = stake * payout_rate
+                elif res_str == "LOSS":
+                    pnl = -stake
+                elif res_str == "TIE":
+                    tie_pol = getattr(self.paper_adapter, "tie_policy", "loss")
+                    pnl = 0.0 if tie_pol == "refund" else -stake
+                else:
+                    pnl = 0.0
+                closed_dt = getattr(trade, "exit_time", now_dt)
+                try:
+                    self.repository.update_result(
+                        trade_id=str(tid),
+                        closed_at=closed_dt,
+                        result=res_str,
+                        pnl=pnl,
+                    )
+                except Exception as exc:
+                    logger.error("Failed to update repository for shadow trade %s: %s", tid, exc)
+                    self._send_alert_safe(f"⚠️ Failed to update repository for shadow trade {tid}: {exc}")
+        return settled

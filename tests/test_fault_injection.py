@@ -49,6 +49,7 @@ class FaultyAdapter:
         self.timeout_after_placed = False
         self.raise_before_placed = False
         self.fail_open_trades = False
+        self.fail_open_trades_after_place = False
 
     def get_assets(self):
         return self.underlying.get_assets()
@@ -78,6 +79,9 @@ class FaultyAdapter:
 
         if self.timeout_after_placed:
             raise TimeoutError("Read timeout waiting for broker response after order sent")
+
+        if self.fail_open_trades_after_place:
+            self.fail_open_trades = True
 
         return receipt
 
@@ -197,7 +201,7 @@ def test_fault_open_trades_call_fails(tmp_path):
 
     real_paper = PaperAdapter(initial_balance=10000.0)
     faulty_adapter = FaultyAdapter(real_paper)
-    faulty_adapter.fail_open_trades = True
+    faulty_adapter.fail_open_trades_after_place = True
 
     state_mgr = StateManager(state_file=tmp_path / "state.json", first_run=True, broker_balance=10000.0)
     breaker = CircuitBreaker(config=cfg)

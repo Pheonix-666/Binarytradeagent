@@ -481,6 +481,17 @@ class AdaptiveConfig(BaseModel):
         return v
 
 
+# ── Execution config ───────────────────────────────────────────────────
+
+
+class ExecutionConfig(BaseModel):
+    """Execution parameters."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    demo_bypasses_paper_gate: bool = Field(default=False)
+
+
 # ── Root config ───────────────────────────────────────────────────────
 
 
@@ -500,6 +511,7 @@ class AppConfig(BaseModel):
     paper_gate: PaperGateConfig
     selection: SelectionConfig = Field(default_factory=SelectionConfig)
     safety: SafetyConfig
+    execution: ExecutionConfig = Field(default_factory=ExecutionConfig)
     llm: LLMConfig
     alerts: AlertsConfig
     backtest: BacktestConfig

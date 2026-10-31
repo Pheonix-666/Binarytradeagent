@@ -55,7 +55,7 @@ class TradeReceipt(BaseModel):
     stake_amount: float
     entry_price: float
     entry_time: datetime
-    payout: float = 0.85
+    payout: Optional[float] = None
     platform_trade_id: Optional[str] = None
     status: str = "OPEN"
 
@@ -86,7 +86,7 @@ class CanonicalTrade:
     direction: str  # "CALL" or "PUT"
     stake: float
     expiry_minutes: int
-    payout: float = 0.85
+    payout: Optional[float] = None
     opened_at: Optional[str] = None
     status: str = "OPEN"
     decision_id: Optional[str] = None
@@ -109,7 +109,8 @@ class CanonicalTrade:
                 exp = int(raw_exp)
             except (ValueError, TypeError):
                 exp = 0
-            payout = float(item.get("payout", 0.85))
+            raw_payout = item.get("payout")
+            payout = float(raw_payout) if raw_payout is not None else None
             return cls(
                 id=t_id,
                 asset=asset,
@@ -135,7 +136,8 @@ class CanonicalTrade:
             exp = int(raw_exp)
         except (ValueError, TypeError):
             exp = 0
-        payout = float(getattr(item, "payout", 0.85))
+        raw_payout = getattr(item, "payout", None)
+        payout = float(raw_payout) if raw_payout is not None else None
         return cls(
             id=t_id,
             asset=asset,

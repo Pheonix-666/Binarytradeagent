@@ -177,3 +177,7 @@ class ValidatedDecision:
     skip_reason: Optional[str] = None
     raw_decision: Optional[DecisionOutput] = None
     shadow_only: bool = False
+    pattern_name: Optional[str] = None
+    pattern_type: Optional[str] = None
+    risk_score: Optional[int] = None
+    is_otc: bool = False

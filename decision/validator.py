@@ -404,6 +404,10 @@ def validate_decision(
         passed_checks.append("check_h_trading_allowed")
 
         # ALL 8 CHECKS PASSED
+        pat_name = matched_cand.pattern.name if matched_cand.pattern else None
+        pat_type = matched_cand.pattern.type if matched_cand.pattern else None
+        is_otc_asset = "_otc" in str(asset).lower() or "otc" in str(asset).lower()
+
         return ValidatedDecision(
             decision=direction,
             is_valid=True,
@@ -418,6 +422,10 @@ def validate_decision(
             skip_reason=None,
             raw_decision=decision_out,
             shadow_only=matched_cand.shadow_only,
+            pattern_name=pat_name,
+            pattern_type=pat_type,
+            risk_score=matched_cand.risk_score,
+            is_otc=is_otc_asset,
         )
 
     except Exception as exc:
