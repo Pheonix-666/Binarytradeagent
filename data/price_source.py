@@ -339,17 +339,8 @@ class CryptoPublicSource(PriceSource):
         return df.tail(n).reset_index(drop=True)
 
 
-class BinomoReadOnlySource(PriceSource):
-    """Stub price source raising NotImplementedError until Phase 9B."""
-
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
-        pass
-
-    def get_assets(self) -> list[AssetQuote]:
-        raise NotImplementedError("BinomoReadOnlySource not implemented until Phase 9B")
-
-    def get_candles(self, asset: str, timeframe: str, n: int) -> pd.DataFrame:
-        raise NotImplementedError("BinomoReadOnlySource not implemented until Phase 9B")
-
-    def now(self) -> datetime:
-        raise NotImplementedError("BinomoReadOnlySource not implemented until Phase 9B")
+def __getattr__(name: str) -> Any:
+    if name == "BinomoReadOnlySource":
+        from adapters.binomo.reader import BinomoReadOnlySource
+        return BinomoReadOnlySource
+    raise AttributeError(f"module '{__name__}' has no attribute '{name}'")

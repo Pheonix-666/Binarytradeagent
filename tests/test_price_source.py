@@ -133,16 +133,15 @@ def test_replay_source_assets(sample_csv_dir: Path):
 
 
 def test_binomo_readonly_source_raises():
-    """BinomoReadOnlySource raises NotImplementedError for all operations."""
+    """BinomoReadOnlySource without active session raises RuntimeError on operations."""
     source = BinomoReadOnlySource()
-    with pytest.raises(NotImplementedError, match="BinomoReadOnlySource not implemented until Phase 9B"):
+    with pytest.raises(RuntimeError, match="No active Playwright page request context"):
         source.get_assets()
 
-    with pytest.raises(NotImplementedError, match="BinomoReadOnlySource not implemented until Phase 9B"):
+    with pytest.raises(RuntimeError, match="No active Playwright page request context"):
         source.get_candles("EURUSD", "1m", 10)
 
-    with pytest.raises(NotImplementedError, match="BinomoReadOnlySource not implemented until Phase 9B"):
-        source.now()
+    assert isinstance(source.now(), datetime)
 
 
 def test_crypto_public_source_closed_candles_and_retry():

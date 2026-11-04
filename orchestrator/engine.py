@@ -17,6 +17,7 @@ import json
 import logging
 import math
 from pathlib import Path
+import threading
 import time
 from typing import Any, Mapping, Optional, Sequence
 
@@ -142,6 +143,11 @@ class Orchestrator:
         self.daily_reports_dir = base_dir if base_dir.name == "daily" else base_dir / "daily"
         self.daily_reports_dir.mkdir(parents=True, exist_ok=True)
         self.cycle_log_path = (self.daily_reports_dir.parent if base_dir.name == "daily" else base_dir) / "cycles.jsonl"
+
+        # Confirmed trades count for execution.confirm_first_n_trades
+        self.confirmed_trades_count: int = int(
+            getattr(self.state_manager, "data", {}).get("confirmed_trades_count", 0)
+        )
 
     def validate_startup(self) -> None:
         """Fail-closed validation of mode and prerequisites."""
@@ -278,6 +284,13 @@ class Orchestrator:
             prices_at_expiry=prices_map,
         )
 
+        # Settle broker trades via platform adapter if supported (e.g. BinomoAdapter)
+        if self.adapter and hasattr(self.adapter, "process_settlements"):
+            try:
+                self.adapter.process_settlements(self.trade_manager)
+            except Exception as exc:
+                logger.warning("Error during broker trade settlement processing: %s", exc)
+
         if settled:
             logger.info("Settled %d shadow trades at %s", len(settled), cur_time.isoformat())
             # Notify adaptive controller if present
@@ -380,26 +393,72 @@ class Orchestrator:
         if self.paper_adapter and hasattr(self.paper_adapter, "set_price"):
             self.paper_adapter.set_price(held.asset, entry_price)
 
-        # 4. Execute through TradeManager
-        exec_res = self.trade_manager.execute(
-            decision=held.decision,
-            account=held.account,
-            adaptive_state=held.adaptive_state,
-            now=held.entry_time,
+        # 4. Check confirm_first_n_trades and telegram_confirm
+        exec_cfg = getattr(self.config, "execution", None)
+        confirm_first_n = getattr(exec_cfg, "confirm_first_n_trades", 0) if exec_cfg else 0
+        confirm_mode = getattr(exec_cfg, "confirm_mode", "auto") if exec_cfg else "auto"
+
+        needs_confirm = (
+            confirm_mode == "telegram_confirm"
+            or (confirm_first_n > 0 and self.confirmed_trades_count < confirm_first_n)
         )
 
-        self._log_cycle_record({
-            "timestamp": held.entry_time.isoformat(),
-            "asset": held.asset,
-            "action": "TRADE" if exec_res.executed else "BLOCKED",
-            "status": exec_res.status,
-            "direction": held.decision.direction,
-            "stake": held.decision.stake_amount,
-            "trade_id": exec_res.trade_id,
-            "entry_price": entry_price,
-            "reason": exec_res.reason,
-            "payout": held.payout,
-        })
+        def _do_execute_order() -> ExecutionResult:
+            res = self.trade_manager.execute(
+                decision=held.decision,
+                account=held.account,
+                adaptive_state=held.adaptive_state,
+                now=held.entry_time,
+            )
+            self._log_cycle_record({
+                "timestamp": held.entry_time.isoformat(),
+                "asset": held.asset,
+                "action": "TRADE" if res.executed else "BLOCKED",
+                "status": res.status,
+                "direction": held.decision.direction,
+                "stake": held.decision.stake_amount,
+                "trade_id": res.trade_id,
+                "entry_price": entry_price,
+                "reason": res.reason,
+                "payout": held.payout,
+            })
+            return res
+
+        if needs_confirm and self.telegram_worker:
+            import uuid
+            ticket_id = f"TKT-{uuid.uuid4().hex[:6].upper()}"
+            ticket_event = threading.Event()
+            result_holder: dict[str, Any] = {"res": None, "approved": False}
+
+            def on_approve():
+                result_holder["approved"] = True
+                self.confirmed_trades_count += 1
+                if hasattr(self.state_manager, "data") and isinstance(self.state_manager.data, dict):
+                    self.state_manager.data["confirmed_trades_count"] = self.confirmed_trades_count
+                result_holder["res"] = _do_execute_order()
+                ticket_event.set()
+
+            def on_reject():
+                result_holder["approved"] = False
+                ticket_event.set()
+
+            timeout = getattr(exec_cfg, "confirm_timeout_seconds", 60)
+            self.telegram_worker.register_ticket(
+                ticket_id=ticket_id,
+                decision=held.decision,
+                account=held.account,
+                on_approve=on_approve,
+                on_reject=on_reject,
+                timeout_seconds=timeout,
+            )
+            ticket_event.wait(timeout=float(timeout) + 1.0)
+            if result_holder["approved"]:
+                return result_holder["res"]
+            logger.warning("Trade ticket %s not approved or rejected. Skipping held order.", ticket_id)
+            return None
+
+        # Execute directly if confirmation is not required
+        exec_res = _do_execute_order()
         return exec_res
 
     def run_heartbeat_job(self, cur_time: datetime) -> None:

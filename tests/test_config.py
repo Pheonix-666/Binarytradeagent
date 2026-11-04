@@ -74,9 +74,9 @@ def test_expiry_not_in_allowed_rejected(temp_config_file):
 
 
 def test_allowed_expiries_invalid_rejected(temp_config_file):
-    """allowed_expiries with values other than 15, 30, 60 must be rejected."""
-    path = temp_config_file(**{"trading.allowed_expiries": [10, 30, 60], "trading.expiry_minutes": 30})
-    with pytest.raises(ValidationError, match="must be subset of"):
+    """allowed_expiries with non-positive values must be rejected."""
+    path = temp_config_file(**{"trading.allowed_expiries": [0, 30, 60], "trading.expiry_minutes": 30})
+    with pytest.raises(ValidationError, match="must be positive integer minutes"):
         load_config(path)
 
 

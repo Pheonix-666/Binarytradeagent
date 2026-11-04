@@ -1140,19 +1140,27 @@ def test_heartbeat_message_content(test_env, mock_alerter):
     assert "Balance: $1,000.00" in msg
 
 
-def test_cli_main_demo_live_rejection(capsys):
+def test_cli_main_demo_live_rejection(capsys, monkeypatch):
     """CLI run rejects demo and live modes with exit code 1 and required message."""
     import main as main_cli
-
-    res_demo = main_cli.main(["run", "--mode", "demo"])
-    assert res_demo == 1
-    captured = capsys.readouterr()
-    assert "not enabled until Phase 10" in captured.err
 
     res_live = main_cli.main(["run", "--mode", "live"])
     assert res_live == 1
     captured2 = capsys.readouterr()
-    assert "not enabled until Phase 10" in captured2.err
+    assert "Startup refused: mode 'live' is rejected" in captured2.err
+
+    class FakeSessionFails:
+        def __init__(self, *a, **kw): pass
+        def start(self, **kw): pass
+        def ensure_logged_in(self, **kw): raise RuntimeError("login verification failed")
+        def is_demo(self): return False
+        def close(self): pass
+
+    monkeypatch.setattr("adapters.binomo.session.BinomoSession", FakeSessionFails)
+    res_demo = main_cli.main(["run", "--mode", "demo"])
+    assert res_demo == 1
+    captured = capsys.readouterr()
+    assert "Startup refused: Binomo session login verification failed" in captured.err
 
 
 def test_cli_main_status_and_summary(capsys):

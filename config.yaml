@@ -147,6 +147,7 @@ execution:
   demo_bypasses_paper_gate: false
   confirm_mode: auto
   confirm_timeout_seconds: 60
+  confirm_first_n_trades: 5
 
 source:
   name: replay
@@ -253,3 +254,55 @@ adaptive:
     tier_on_decay: caution
     tier_on_persistent: defensive
     persist_windows: 2
+
+binomo:
+  url: "https://binomo.com"
+  profile_dir: "state/playwright_profile"
+  option_type: "turbo"          # blitz | turbo | standard
+  requests_per_minute: 60
+  candle_timeframe_segments:
+    "1m": 60
+    "5m": 300
+    "15m": 900
+    "30m": 1800
+    "60m": 3600
+  demo_required: true
+  confirm_timeout_seconds: 15.0
+  max_frame_age_seconds: 60.0
+  expiry_labels:
+    1: "1 min"
+    5: "5 min"
+    15: "15 min"
+    30: "30 min"
+    60: "60 min"
+  ui:
+    amount_input:
+      role: "spinbutton"
+      name: "Amount"
+    expiry_selector:
+      role: "button"
+      name: "Expiration time"
+    expiry_option:
+      role: "button"
+      name: "{label}"
+    call_button:
+      role: "button"
+      name: "Call"
+    put_button:
+      role: "button"
+      name: "Put"
+    asset_selector:
+      role: "button"
+      name: "Asset selection"
+    asset_option:
+      role: "button"
+      name: "{name}"
+    demo_indicator:
+      role: "text"
+      name: "Demo account"
+    active_asset_label:
+      role: "text"
+      name: "Active Asset"
+    active_expiry_label:
+      role: "text"
+      name: "Active Expiry"

@@ -1,4 +1,5 @@
 .env
+.env.example
 logs/
 reports/
 state/
@@ -15,5 +16,13 @@ data_history/
 docs/backtests/
 *.db
 discovery_report.md
+discovery_report_*.md
+discovery_summary.md
+discovery_summary_*.md
+discovery_focus.md
+discovery_focus_*.md
+reports_archive/
+reports/binomo_calibration_*.md
 collected.txt
 pytest_out.txt
+cleanup_proposal.md

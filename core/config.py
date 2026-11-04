@@ -66,11 +66,12 @@ class TradingConfig(BaseModel):
 
     @model_validator(mode="after")
     def _validate_expiry(self) -> "TradingConfig":
-        valid = {15, 30, 60}
+        if not self.allowed_expiries:
+            raise ValueError("allowed_expiries must not be empty")
         for e in self.allowed_expiries:
-            if e not in valid:
+            if not isinstance(e, int) or e <= 0:
                 raise ValueError(
-                    f"allowed_expiries contains {e}; must be subset of {valid}"
+                    f"allowed_expiries contains {e}; must be positive integer minutes"
                 )
         if self.expiry_minutes not in self.allowed_expiries:
             raise ValueError(
@@ -492,6 +493,7 @@ class ExecutionConfig(BaseModel):
     demo_bypasses_paper_gate: bool = Field(default=False)
     confirm_mode: Literal["auto", "telegram_confirm"] = "auto"
     confirm_timeout_seconds: int = Field(ge=1, default=60)
+    confirm_first_n_trades: int = Field(ge=0, default=5)
 
 
 class SourceConfig(BaseModel):
@@ -506,6 +508,56 @@ class SourceConfig(BaseModel):
     max_retries: int = Field(ge=0, default=3)
     backoff_base_seconds: float = Field(gt=0, default=1.0)
     public_api_url: str = "https://data-api.binance.vision/api/v3"
+
+
+class BinomoUIConfig(BaseModel):
+    """UI element selector definitions for Binomo trading panel."""
+
+    model_config = ConfigDict(extra="allow")
+
+    amount_input: Any = Field(default_factory=lambda: {"role": "spinbutton", "name": "Amount"})
+    expiry_selector: Any = Field(default_factory=lambda: {"role": "button", "name": "Expiration time"})
+    expiry_option: Any = Field(default_factory=lambda: {"role": "button", "name": "{label}"})
+    call_button: Any = Field(default_factory=lambda: {"role": "button", "name": "Call"})
+    put_button: Any = Field(default_factory=lambda: {"role": "button", "name": "Put"})
+    asset_selector: Any = Field(default_factory=lambda: {"role": "button", "name": "Asset selection"})
+    asset_option: Any = Field(default_factory=lambda: {"role": "button", "name": "{name}"})
+    demo_indicator: Any = Field(default_factory=lambda: {"role": "text", "name": "Demo account"})
+    active_asset_label: Any = Field(default_factory=lambda: {"role": "text", "name": "Active Asset"})
+    active_expiry_label: Any = Field(default_factory=lambda: {"role": "text", "name": "Active Expiry"})
+
+
+class BinomoConfig(BaseModel):
+    """Binomo platform connection and passive reading parameters."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    url: str = "https://binomo.com"
+    profile_dir: str = "state/playwright_profile"
+    option_type: Literal["blitz", "turbo", "standard"] = "turbo"
+    requests_per_minute: int = Field(ge=1, default=60)
+    candle_timeframe_segments: dict[str, int] = Field(
+        default_factory=lambda: {
+            "1m": 60,
+            "5m": 300,
+            "15m": 900,
+            "30m": 1800,
+            "60m": 3600,
+        }
+    )
+    demo_required: bool = True
+    confirm_timeout_seconds: float = Field(gt=0, default=15.0)
+    max_frame_age_seconds: float = Field(gt=0, default=60.0)
+    expiry_labels: dict[int, str] = Field(
+        default_factory=lambda: {
+            1: "1 min",
+            5: "5 min",
+            15: "15 min",
+            30: "30 min",
+            60: "60 min",
+        }
+    )
+    ui: BinomoUIConfig = Field(default_factory=BinomoUIConfig)
 
 
 class OrchestratorConfig(BaseModel):
@@ -569,6 +621,7 @@ class AppConfig(BaseModel):
     alerts: AlertsConfig
     backtest: BacktestConfig
     adaptive: AdaptiveConfig = Field(default_factory=AdaptiveConfig)
+    binomo: BinomoConfig = Field(default_factory=BinomoConfig)
 
     @model_validator(mode="after")
     def _sync_execution_model(self) -> "AppConfig":

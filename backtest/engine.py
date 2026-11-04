@@ -589,7 +589,7 @@ class BacktestEngine:
                         direction=cand.direction.value,
                         expiry_minutes=expiry_minutes,
                         stake=stake,
-                        max_stake_pct=target_pct,
+                        max_stake_pct=cand.max_stake_pct,
                         shadow_only=False,
                     )
                     acc_snapshot = AccountSnapshot(

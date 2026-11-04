@@ -1,0 +1,6 @@
+data/market.db
+logs/test_decisions.jsonl
+reports/cycles.jsonl
+reports/daily/2026-10-31.md
+reports/daily/2026-11-02.md
+
