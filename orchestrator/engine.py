@@ -152,11 +152,11 @@ class Orchestrator:
     def validate_startup(self) -> None:
         """Fail-closed validation of mode and prerequisites."""
         mode_str = str(self.config.mode).lower()
-        if mode_str in {"demo", "live"}:
+        if mode_str == "live":
             raise ValueError(f"Startup refused: mode '{self.config.mode}' is not enabled until Phase 10")
 
-        if mode_str not in {"record", "paper"}:
-            raise ValueError(f"Startup refused: mode '{self.config.mode}' is unsupported. Only 'record' and 'paper' are permitted in Phase 9.")
+        if mode_str not in {"record", "paper", "demo"}:
+            raise ValueError(f"Startup refused: mode '{self.config.mode}' is unsupported. Only 'record', 'paper', and 'demo' are permitted.")
 
         if self.repository is None:
             raise ValueError("Startup refused: TradeRepository is required")
@@ -656,11 +656,12 @@ class Orchestrator:
             candles_by_tf: dict[str, pd.DataFrame] = {}
             data_stale = False
             for tf in ["1d", "1h", "15m", "5m", "1m"]:
+                needed = max(self.warmup_bars.get(tf, 150), 200 if tf in {"1m", "5m"} else 150)
                 df_tf = self.store.sync_candles_from_source(
                     source=self.source,
                     asset_id=asset,
                     timeframe=tf,
-                    n_needed=200 if tf in {"1m", "5m"} else 50,
+                    n_needed=needed,
                 )
                 candles_by_tf[tf] = df_tf
                 if not df_tf.empty and tf in {"1m", "5m"}:

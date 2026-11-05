@@ -106,6 +106,47 @@ class FakeLocator:
 class FakePage:
     """Mock Playwright Page returning FakeLocators based on role/name/test_id."""
 
+    class request:
+        @staticmethod
+        def get(url, **kwargs):
+            if "/platform/private/v2/currencies" in url:
+                class FakeCurrenciesResp:
+                    status = 200
+                    def json(self):
+                        return {
+                            "data": {
+                                "current": "USD",
+                                "list": [
+                                    {
+                                        "iso": "USD",
+                                        "limits": {
+                                            "binary_option": {"min": 1.0, "max": 1000.0},
+                                            "standard_trade": {"min": 2.0, "max": 2000.0},
+                                        },
+                                    }
+                                ],
+                            }
+                        }
+                return FakeCurrenciesResp()
+            elif "/bo-assets" in url:
+                class FakeAssetsResp:
+                    status = 200
+                    def json(self):
+                        return [
+                            {
+                                "ric": "EUR/USD",
+                                "name": "EUR/USD",
+                                "trading_tools_settings": {"ftt": {"base_payment_rate_turbo": 83, "enabled_account_types": ["demo"]}},
+                            },
+                            {
+                                "ric": "Z-EUR/USD2",
+                                "name": "EUR/USD (OTC)",
+                                "trading_tools_settings": {"ftt": {"base_payment_rate_turbo": 85, "enabled_account_types": ["demo"]}},
+                            },
+                        ]
+                return FakeAssetsResp()
+            raise NotImplementedError(f"Unhandled GET url: {url}")
+
     def __init__(self, locators: Optional[dict[str, FakeLocator]] = None) -> None:
         self.locators: dict[str, FakeLocator] = locators or {}
         self.dialog_visible: bool = False
@@ -179,7 +220,22 @@ def test_place_trade_happy_path():
     session.is_demo.return_value = True
 
     reader = MagicMock()
-    reader._execute_get.return_value = [{"min_amount": 1.0, "max_amount": 1000.0}]
+    reader.base_api_url = "https://api.binomo.com"
+    reader.get_ric_to_name_map.return_value = {"EUR/USD": "EUR/USD"}
+    reader._execute_get.return_value = {
+        "data": {
+            "current": "USD",
+            "list": [
+                {
+                    "iso": "USD",
+                    "limits": {
+                        "binary_option": {"min": 1.0, "max": 1000.0},
+                        "standard_trade": {"min": 2.0, "max": 2000.0},
+                    },
+                }
+            ],
+        }
+    }
 
     breaker = CircuitBreaker(config=cfg)
 
@@ -337,7 +393,22 @@ def test_place_trade_aborts_on_stake_mismatch_and_currency_limits():
     session.is_logged_in.return_value = True
 
     reader = MagicMock()
-    reader._execute_get.return_value = [{"min_amount": 1.0, "max_amount": 1000.0}]
+    reader.base_api_url = "https://api.binomo.com"
+    reader.get_ric_to_name_map.return_value = {"EUR/USD": "EUR/USD"}
+    reader._execute_get.return_value = {
+        "data": {
+            "current": "USD",
+            "list": [
+                {
+                    "iso": "USD",
+                    "limits": {
+                        "binary_option": {"min": 1.0, "max": 1000.0},
+                        "standard_trade": {"min": 2.0, "max": 2000.0},
+                    },
+                }
+            ],
+        }
+    }
 
     adapter = BinomoAdapter(session=session, ws_listener=ws, reader=reader, config=cfg)
     adapter.load_platform_limits()

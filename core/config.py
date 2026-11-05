@@ -525,6 +525,10 @@ class BinomoUIConfig(BaseModel):
     demo_indicator: Any = Field(default_factory=lambda: {"role": "text", "name": "Demo account"})
     active_asset_label: Any = Field(default_factory=lambda: {"role": "text", "name": "Active Asset"})
     active_expiry_label: Any = Field(default_factory=lambda: {"role": "text", "name": "Active Expiry"})
+    blocking_overlays: list[str] = Field(default_factory=list)
+    call_button_labels: list[str] = Field(default_factory=list)
+    put_button_labels: list[str] = Field(default_factory=list)
+    validation_samples: dict[str, str] = Field(default_factory=dict)
 
 
 class BinomoConfig(BaseModel):
@@ -548,15 +552,9 @@ class BinomoConfig(BaseModel):
     demo_required: bool = True
     confirm_timeout_seconds: float = Field(gt=0, default=15.0)
     max_frame_age_seconds: float = Field(gt=0, default=60.0)
-    expiry_labels: dict[int, str] = Field(
-        default_factory=lambda: {
-            1: "1 min",
-            5: "5 min",
-            15: "15 min",
-            30: "30 min",
-            60: "60 min",
-        }
-    )
+    limits_product: Literal["binary_option", "standard_trade"] = "binary_option"
+    amount_scale: float = Field(default=1.0, gt=0)
+    expiry_labels: dict[int, str] = Field(default_factory=dict)
     ui: BinomoUIConfig = Field(default_factory=BinomoUIConfig)
 
 

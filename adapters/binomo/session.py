@@ -132,8 +132,19 @@ class BinomoSession:
         return self.ws_listener.is_logged_in()
 
     def is_demo(self) -> bool:
-        """True ONLY if latest balance_changed payload has account_type == 'demo'."""
-        return self.ws_listener.is_demo()
+        """True ONLY if latest balance_changed payload has account_type == 'demo' or DOM shows Demo account."""
+        if self.ws_listener.is_demo():
+            return True
+        ws_acct = self.ws_listener.get_account_type()
+        if ws_acct is not None and ws_acct.lower() != "demo":
+            return False
+        if self._page is not None:
+            try:
+                if self._page.locator("text='Demo account'").count() > 0:
+                    return True
+            except Exception:
+                pass
+        return False
 
     def ensure_logged_in(self, timeout: float = 300.0, check_interval: float = 1.0) -> bool:
         """Wait for manual user login in browser window.

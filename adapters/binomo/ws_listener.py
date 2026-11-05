@@ -45,8 +45,9 @@ def parse_phoenix_frame(raw_text: str) -> Optional[tuple[Optional[str], Optional
 class BinomoWSListener:
     """Thread-safe passive Phoenix WebSocket frame listener."""
 
-    def __init__(self) -> None:
+    def __init__(self, amount_scale: float = 1.0) -> None:
         self._lock = threading.Lock()
+        self.amount_scale: float = float(amount_scale)
 
         # Account & balance state
         self._latest_balance: Optional[float] = None
@@ -169,7 +170,8 @@ class BinomoWSListener:
                 if isinstance(payload, dict):
                     if "balance" in payload and payload["balance"] not in (None, "<num>", ""):
                         try:
-                            self._latest_balance = float(payload["balance"])
+                            raw_bal = float(payload["balance"])
+                            self._latest_balance = raw_bal * self.amount_scale
                         except (ValueError, TypeError):
                             pass
                     if "account_type" in payload:
@@ -194,19 +196,27 @@ class BinomoWSListener:
             if not deal_uuid:
                 return
 
+            raw_amt = self._safe_float(payload.get("amount") or payload.get("bet"))
+            scaled_amt = (raw_amt * self.amount_scale) if raw_amt is not None else None
+            close_created = payload.get("close_quote_created_at") or payload.get("finished_at")
+            fin_at = payload.get("finished_at") or payload.get("close_quote_created_at")
+
             deal_info: dict[str, Any] = {
                 "uuid": deal_uuid,
                 "asset_ric": payload.get("asset_ric") or payload.get("ric") or payload.get("asset") or "",
                 "trend": payload.get("trend") or payload.get("direction") or "",
-                "amount": self._safe_float(payload.get("amount") or payload.get("bet")),
+                "amount": scaled_amt,
+                "raw_amount": raw_amt,
                 "open_rate": self._safe_float(payload.get("open_rate") or payload.get("rate")),
                 "end_rate": None,
                 "payment_rate": self._safe_float(payload.get("payment_rate")),
                 "status": str(payload.get("status") or "open"),
                 "deal_type": str(payload.get("deal_type") or payload.get("option_type") or ""),
                 "created_at": payload.get("created_at") or payload.get("open_quote_created_at") or payload.get("requested_at"),
-                "finished_at": None,
+                "close_quote_created_at": close_created,
+                "finished_at": fin_at,
                 "updated_at": now_utc.isoformat(),
+                "raw_payload": payload,
             }
             self._open_deals[deal_uuid] = deal_info
 
@@ -219,8 +229,11 @@ class BinomoWSListener:
             deal_info["uuid"] = deal_uuid
             deal_info["asset_ric"] = payload.get("asset_ric") or payload.get("ric") or deal_info.get("asset_ric", "")
             deal_info["trend"] = payload.get("trend") or payload.get("direction") or deal_info.get("trend", "")
+            deal_info["created_at"] = payload.get("created_at") or payload.get("open_quote_created_at") or payload.get("requested_at") or deal_info.get("created_at")
             if "amount" in payload or "bet" in payload:
-                deal_info["amount"] = self._safe_float(payload.get("amount") or payload.get("bet"))
+                raw_amt = self._safe_float(payload.get("amount") or payload.get("bet"))
+                deal_info["raw_amount"] = raw_amt
+                deal_info["amount"] = (raw_amt * self.amount_scale) if raw_amt is not None else None
             if "end_rate" in payload or "close_rate" in payload:
                 deal_info["end_rate"] = self._safe_float(payload.get("end_rate") or payload.get("close_rate"))
             if "payment_rate" in payload:
@@ -228,8 +241,12 @@ class BinomoWSListener:
             deal_info["status"] = str(payload.get("status") or "closed")
             if "deal_type" in payload or "option_type" in payload:
                 deal_info["deal_type"] = str(payload.get("deal_type") or payload.get("option_type") or "")
-            deal_info["finished_at"] = payload.get("finished_at") or payload.get("close_quote_created_at")
+            close_created = payload.get("close_quote_created_at") or payload.get("finished_at") or deal_info.get("close_quote_created_at")
+            fin_at = payload.get("finished_at") or payload.get("close_quote_created_at") or deal_info.get("finished_at")
+            deal_info["close_quote_created_at"] = close_created
+            deal_info["finished_at"] = fin_at
             deal_info["updated_at"] = now_utc.isoformat()
+            deal_info["raw_payload"] = payload
 
             self._closed_deals[deal_uuid] = deal_info
 

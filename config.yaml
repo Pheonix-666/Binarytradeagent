@@ -269,6 +269,8 @@ binomo:
   demo_required: true
   confirm_timeout_seconds: 15.0
   max_frame_age_seconds: 60.0
+  limits_product: "binary_option"
+  amount_scale: 1.0
   expiry_labels:
     1: "1 min"
     5: "5 min"
@@ -306,3 +308,20 @@ binomo:
     active_expiry_label:
       role: "text"
       name: "Active Expiry"
+    blocking_overlays:
+      - "[role='dialog']"
+      - ".modal-dialog"
+      - ".popup-container"
+      - ".blocking-modal"
+      - ".dialog-overlay"
+    call_button_labels:
+      - "call"
+      - "up"
+      - "higher"
+    put_button_labels:
+      - "put"
+      - "down"
+      - "lower"
+    validation_samples:
+      expiry_option: "1 min"
+      asset_option: "Crypto IDX"

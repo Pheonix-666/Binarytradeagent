@@ -129,9 +129,9 @@ def test_env(tmp_path: Path, mock_alerter: TelegramAlerter):
 
 
 def test_startup_rejects_demo_and_live(test_env):
-    """Refuse to start if mode is demo or live with exact message 'not enabled until Phase 10'."""
+    """Refuse to start if mode is live with exact message 'not enabled until Phase 10'."""
     env = test_env
-    env["config"].mode = "demo"
+    env["config"].mode = "live"
     orch = Orchestrator(
         config=env["config"],
         source=env["source"],
@@ -148,8 +148,8 @@ def test_startup_rejects_demo_and_live(test_env):
     with pytest.raises(ValueError, match="not enabled until Phase 10"):
         orch.validate_startup()
 
-    env["config"].mode = "live"
-    with pytest.raises(ValueError, match="not enabled until Phase 10"):
+    env["config"].mode = "invalid_mode"
+    with pytest.raises(ValueError, match="unsupported"):
         orch.validate_startup()
 
 

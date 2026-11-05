@@ -47,6 +47,10 @@ class StakeOutOfRange(Exception):
     """Raised when a stake amount is outside platform currency min/max limits or mismatches readback."""
 
 
+class StakeLimitsUnavailable(Exception):
+    """Raised when platform stake limits cannot be parsed from /platform/private/v2/currencies."""
+
+
 class PanelBlocked(Exception):
     """Raised when a modal or popup blocks the trading panel."""
 
@@ -65,6 +69,40 @@ class AssetSelectionMismatch(Exception):
 
 class ButtonLabelMismatch(Exception):
     """Raised when the action button's accessible name does not match the trade direction."""
+
+
+# ── Helper Functions ─────────────────────────────────────────────────────────
+
+
+def parse_deal_timestamp(val: Any) -> Optional[datetime]:
+    """Parse deal timestamp (ISO string, unix epoch in sec or ms) to UTC datetime."""
+    if val is None or val == "":
+        return None
+    if isinstance(val, (int, float)):
+        ts = float(val)
+        if ts > 1e11:
+            ts = ts / 1000.0
+        return datetime.fromtimestamp(ts, tz=timezone.utc)
+    if isinstance(val, str):
+        val_clean = val.strip()
+        try:
+            num = float(val_clean)
+            if num > 1e11:
+                num = num / 1000.0
+            return datetime.fromtimestamp(num, tz=timezone.utc)
+        except ValueError:
+            pass
+        if val_clean.endswith("Z"):
+            val_clean = val_clean[:-1] + "+00:00"
+        try:
+            return datetime.fromisoformat(val_clean)
+        except Exception:
+            return None
+    if isinstance(val, datetime):
+        if val.tzinfo is None:
+            return val.replace(tzinfo=timezone.utc)
+        return val
+    return None
 
 
 # ── Selector Resolution & Validation Helpers ─────────────────────────────────
@@ -158,11 +196,25 @@ def validate_ui_selectors(page: Any, ui_config: Any) -> list[str]:
             logger.debug("Selector '%s' failed resolution check: %s", key, exc)
             failed.append(key)
 
-    # Template selectors: verify formatting and resolution syntax
-    templates = [
-        ("expiry_option", {"label": "1 min"}),
-        ("asset_option", {"name": "Crypto IDX"}),
-    ]
+    # Template selectors: verify formatting and resolution syntax using config samples
+    val_samples = getattr(ui_config, "validation_samples", {}) or {}
+    if isinstance(ui_config, dict) and not val_samples:
+        val_samples = ui_config.get("validation_samples", {}) or {}
+
+    sample_exp = val_samples.get("expiry_option") or val_samples.get("expiry_label")
+    sample_asset = val_samples.get("asset_option") or val_samples.get("asset_name")
+
+    if not sample_exp:
+        failed.append("validation_samples.expiry_option")
+    if not sample_asset:
+        failed.append("validation_samples.asset_option")
+
+    templates: list[tuple[str, dict[str, str]]] = []
+    if sample_exp:
+        templates.append(("expiry_option", {"label": sample_exp}))
+    if sample_asset:
+        templates.append(("asset_option", {"name": sample_asset}))
+
     for key, sample_kwargs in templates:
         spec = getattr(ui_config, key, None)
         if spec is None and isinstance(ui_config, dict):
@@ -176,22 +228,35 @@ def validate_ui_selectors(page: Any, ui_config: Any) -> list[str]:
             logger.debug("Template selector '%s' failed validation: %s", key, exc)
             failed.append(key)
 
+    # Validate button label lists
+    call_labels = getattr(ui_config, "call_button_labels", None)
+    if call_labels is None and isinstance(ui_config, dict):
+        call_labels = ui_config.get("call_button_labels")
+    if not call_labels:
+        failed.append("call_button_labels")
+
+    put_labels = getattr(ui_config, "put_button_labels", None)
+    if put_labels is None and isinstance(ui_config, dict):
+        put_labels = ui_config.get("put_button_labels")
+    if not put_labels:
+        failed.append("put_button_labels")
+
+    # Validate blocking overlays list
+    overlays = getattr(ui_config, "blocking_overlays", None)
+    if overlays is None and isinstance(ui_config, dict):
+        overlays = ui_config.get("blocking_overlays")
+    if not overlays:
+        logger.warning("Startup warning: binomo.ui.blocking_overlays is empty; overlay blocking checks will be skipped.")
+
     return failed
 
 
-def is_panel_blocked(page: Any) -> bool:
+def is_panel_blocked(page: Any, blocking_overlays: Optional[list[str]] = None) -> bool:
     """Check if an overlay, modal, or dialog blocks the trading panel."""
-    if page is None:
+    if page is None or not blocking_overlays:
         return False
 
-    modal_selectors = [
-        "[role='dialog']",
-        ".modal-dialog",
-        ".popup-container",
-        ".blocking-modal",
-        ".dialog-overlay",
-    ]
-    for sel in modal_selectors:
+    for sel in blocking_overlays:
         try:
             loc = page.locator(sel)
             if hasattr(loc, "count") and loc.count() > 0:
@@ -220,8 +285,6 @@ class BinomoAdapter(PlatformAdapter):
         alerter: Optional[TelegramAlerter] = None,
     ) -> None:
         self.session = session
-        self.ws_listener = ws_listener or (session.ws_listener if session else BinomoWSListener())
-        self.reader = reader or BinomoReadOnlySource(session=session, config=config, alerter=alerter)
         self.config = config
         self.breaker = breaker
         self.alerter = alerter
@@ -231,31 +294,37 @@ class BinomoAdapter(PlatformAdapter):
 
         # Settled deals tracking to avoid duplicate settlement calls
         self._settled_deal_uuids: set[str] = set()
+        self._logged_unknown_deal_uuids: set[str] = set()
 
-        # Cached platform currency stake limits
-        self._platform_min_stake: float = 1.0
-        self._platform_max_stake: float = 1000.0
+        # Cached platform currency stake limits (no default limits)
+        self._platform_min_stake: Optional[float] = None
+        self._platform_max_stake: Optional[float] = None
         self._platform_limits_loaded: bool = False
 
         # Load configurations
         self.confirm_timeout_seconds: float = 15.0
         self.max_frame_age_seconds: float = 60.0
-        self.expiry_labels: dict[int, str] = {
-            1: "1 min",
-            5: "5 min",
-            15: "15 min",
-            30: "30 min",
-            60: "60 min",
-        }
+        self.limits_product: str = "binary_option"
+        self.amount_scale: float = 1.0
+        self.expiry_labels: dict[int, str] = {}
+        self._ric_to_name_map: dict[str, str] = {}
 
         if config and hasattr(config, "binomo"):
             b_cfg = config.binomo
             self.confirm_timeout_seconds = float(getattr(b_cfg, "confirm_timeout_seconds", 15.0))
             self.max_frame_age_seconds = float(getattr(b_cfg, "max_frame_age_seconds", 60.0))
+            self.limits_product = str(getattr(b_cfg, "limits_product", "binary_option"))
+            self.amount_scale = float(getattr(b_cfg, "amount_scale", 1.0))
             if getattr(b_cfg, "expiry_labels", None):
                 self.expiry_labels = {
                     int(k): str(v) for k, v in b_cfg.expiry_labels.items()
                 }
+
+        self.ws_listener = ws_listener or (session.ws_listener if session else BinomoWSListener(amount_scale=self.amount_scale))
+        if hasattr(self.ws_listener, "amount_scale"):
+            self.ws_listener.amount_scale = self.amount_scale
+
+        self.reader = reader or BinomoReadOnlySource(session=session, config=config, alerter=alerter)
 
     @property
     def ui_config(self) -> Any:
@@ -263,33 +332,112 @@ class BinomoAdapter(PlatformAdapter):
             return getattr(self.config.binomo, "ui", None)
         return None
 
+    # ── Asset Name Resolution ────────────────────────────────────────────────
+
+    def get_ric_to_name_map(self) -> dict[str, str]:
+        """Build or return ric-to-display-name map from the reader's asset table."""
+        if not self._ric_to_name_map:
+            if self.reader and hasattr(self.reader, "get_ric_to_name_map"):
+                try:
+                    res = self.reader.get_ric_to_name_map()
+                    if isinstance(res, dict):
+                        self._ric_to_name_map = res
+                except Exception:
+                    pass
+            if not self._ric_to_name_map and self.reader and hasattr(self.reader, "get_assets"):
+                try:
+                    assets = self.reader.get_assets()
+                    if isinstance(assets, list):
+                        self._ric_to_name_map = {a.asset_id: a.name for a in assets if hasattr(a, "asset_id") and hasattr(a, "name")}
+                except Exception:
+                    pass
+        return dict(self._ric_to_name_map)
+
+    def get_display_name(self, ric: str) -> Optional[str]:
+        """Return display name for given RIC; None if unmapped."""
+        mapping = self.get_ric_to_name_map()
+        return mapping.get(ric)
+
     # ── Platform Currency Limits ─────────────────────────────────────────────
 
     def load_platform_limits(self) -> tuple[float, float]:
-        """Fetch and cache min/max stake limits from /platform/private/v2/currencies."""
+        """Fetch and cache min/max stake limits from /platform/private/v2/currencies.
+
+        Parses data.list[] with iso equal to data.current, taking limits.<product>.min/max;
+        product from config binomo.limits_product (binary_option or standard_trade,
+        default binary_option; logs both products' limits once).
+        If limits cannot be parsed, raises StakeLimitsUnavailable and refuses to trade
+        (no default limits).
+        """
         try:
             url = f"{self.reader.base_api_url}/platform/private/v2/currencies"
             data = self.reader._execute_get(url)
-            currencies: list[dict[str, Any]] = []
-            if isinstance(data, list):
-                currencies = data
-            elif isinstance(data, dict):
-                if isinstance(data.get("data"), list):
-                    currencies = data["data"]
-                elif isinstance(data.get("currencies"), list):
-                    currencies = data["currencies"]
-
-            if currencies and isinstance(currencies[0], dict):
-                c0 = currencies[0]
-                min_val = c0.get("min_payment") or c0.get("min_bet") or c0.get("min_amount") or 1.0
-                max_val = c0.get("max_payment") or c0.get("max_bet") or c0.get("max_amount") or 1000.0
-                self._platform_min_stake = float(min_val)
-                self._platform_max_stake = float(max_val)
-                self._platform_limits_loaded = True
-                logger.info("Loaded platform stake limits: [%.2f, %.2f]", self._platform_min_stake, self._platform_max_stake)
         except Exception as exc:
-            logger.warning("Could not load /platform/private/v2/currencies: %s. Using default limits [%.2f, %.2f]",
-                           exc, self._platform_min_stake, self._platform_max_stake)
+            raise StakeLimitsUnavailable(f"Failed to fetch /platform/private/v2/currencies: {exc}") from exc
+
+        data_obj: dict[str, Any] = {}
+        if isinstance(data, dict):
+            if isinstance(data.get("data"), dict):
+                data_obj = data["data"]
+            else:
+                data_obj = data
+        else:
+            raise StakeLimitsUnavailable(f"Unexpected currencies response type: {type(data)}")
+
+        current_iso = data_obj.get("current")
+        currencies_list = data_obj.get("list")
+
+        if not current_iso or not isinstance(currencies_list, list):
+            raise StakeLimitsUnavailable(
+                f"Cannot parse currencies: current={current_iso}, list_type={type(currencies_list)}"
+            )
+
+        matched_currency: Optional[dict[str, Any]] = None
+        for item in currencies_list:
+            if isinstance(item, dict) and item.get("iso") == current_iso:
+                matched_currency = item
+                break
+
+        if not matched_currency:
+            raise StakeLimitsUnavailable(
+                f"Currency '{current_iso}' not found in currencies list"
+            )
+
+        limits_dict = matched_currency.get("limits")
+        if not isinstance(limits_dict, dict):
+            raise StakeLimitsUnavailable(
+                f"No 'limits' found for currency '{current_iso}'"
+            )
+
+        # Log both products' limits once so operator can choose
+        bo_limits = limits_dict.get("binary_option") or {}
+        st_limits = limits_dict.get("standard_trade") or {}
+        logger.info(
+            "Platform stake limits for %s: binary_option=[%s, %s], standard_trade=[%s, %s]",
+            current_iso,
+            bo_limits.get("min"),
+            bo_limits.get("max"),
+            st_limits.get("min"),
+            st_limits.get("max"),
+        )
+
+        chosen_product = self.limits_product or "binary_option"
+        product_limits = limits_dict.get(chosen_product)
+        if not isinstance(product_limits, dict) or "min" not in product_limits or "max" not in product_limits:
+            raise StakeLimitsUnavailable(
+                f"Stake limits unavailable for product '{chosen_product}' in currency '{current_iso}'"
+            )
+
+        try:
+            self._platform_min_stake = float(product_limits["min"])
+            self._platform_max_stake = float(product_limits["max"])
+            self._platform_limits_loaded = True
+            logger.info("Loaded platform stake limits for '%s': [%.2f, %.2f]",
+                        chosen_product, self._platform_min_stake, self._platform_max_stake)
+        except (ValueError, TypeError) as exc:
+            raise StakeLimitsUnavailable(
+                f"Failed parsing float limits for product '{chosen_product}': {product_limits}"
+            ) from exc
 
         return self._platform_min_stake, self._platform_max_stake
 
@@ -352,15 +500,25 @@ class BinomoAdapter(PlatformAdapter):
             p_rate = d.get("payment_rate") or 0.0
             payout_dec = (p_rate / 100.0) if p_rate > 1.0 else p_rate
 
+            start_dt = parse_deal_timestamp(d.get("created_at") or d.get("open_quote_created_at") or d.get("requested_at"))
+            end_dt = parse_deal_timestamp(d.get("close_quote_created_at") or d.get("finished_at"))
+            entry_time = start_dt or now_dt
+
+            if start_dt and end_dt:
+                diff_sec = (end_dt - start_dt).total_seconds()
+                derived_expiry = max(1, int(round(diff_sec / 60.0)))
+            else:
+                derived_expiry = int(self.config.trading.expiry_minutes if (self.config and hasattr(self.config, "trading")) else 1)
+
             trades.append(
                 Trade(
                     trade_id=uuid_str,
                     asset_id=str(d.get("asset_ric") or ""),
                     direction=direction,
-                    expiry_minutes=int(self.config.trading.expiry_minutes if self.config else 1),
+                    expiry_minutes=derived_expiry,
                     stake_amount=float(d.get("amount") or 0.0),
                     entry_price=float(d.get("open_rate") or 0.0),
-                    entry_time=now_dt,
+                    entry_time=entry_time,
                     payout=float(payout_dec),
                     platform_trade_id=uuid_str,
                     status="OPEN",
@@ -416,15 +574,28 @@ class BinomoAdapter(PlatformAdapter):
             p_rate = d.get("payment_rate") or 0.0
             payout_dec = (p_rate / 100.0) if p_rate > 1.0 else p_rate
 
+            start_dt = parse_deal_timestamp(d.get("created_at") or d.get("open_quote_created_at") or d.get("requested_at"))
+            end_dt = parse_deal_timestamp(d.get("close_quote_created_at") or d.get("finished_at"))
+            entry_time = start_dt or now_dt
+
+            if start_dt and end_dt:
+                diff_sec = (end_dt - start_dt).total_seconds()
+                derived_expiry = max(1, int(round(diff_sec / 60.0)))
+            else:
+                derived_expiry = int(self.config.trading.expiry_minutes if (self.config and hasattr(self.config, "trading")) else 1)
+
+            raw_amt = float(d.get("amount") or d.get("bet") or 0.0)
+            scaled_amt = raw_amt * self.amount_scale if "raw_amount" not in d else raw_amt
+
             trades.append(
                 Trade(
                     trade_id=uuid_str,
                     asset_id=str(d.get("asset_ric") or d.get("ric") or ""),
                     direction=direction,
-                    expiry_minutes=int(self.config.trading.expiry_minutes if self.config else 1),
-                    stake_amount=float(d.get("amount") or d.get("bet") or 0.0),
+                    expiry_minutes=derived_expiry,
+                    stake_amount=scaled_amt,
                     entry_price=float(d.get("open_rate") or d.get("rate") or 0.0),
-                    entry_time=now_dt,
+                    entry_time=entry_time,
                     payout=float(payout_dec),
                     platform_trade_id=uuid_str,
                     status="CLOSED",
@@ -468,26 +639,41 @@ class BinomoAdapter(PlatformAdapter):
     def process_settlements(self, trade_manager: Any) -> list[dict[str, Any]]:
         """Feed closed deal outcomes to TradeManager.record_settlement.
 
-        Maps status won/lost/tie to TradeResult. Raises ValueError on unknown status.
+        Maps platform deal uuid to internal trade id via open trade's platform_trade_id
+        in trade_manager.state_manager.data["open_trades"].
+        Calls record_settlement with the INTERNAL id and the payout from the deal (never default).
+        Unknown uuids are logged once and skipped.
+        Prevents double settlement by tracking settled uuids.
         """
         closed_deals = self.ws_listener.get_closed_deals()
         settled_results: list[dict[str, Any]] = []
 
-        open_trade_ids: set[str] = set()
+        platform_to_internal: dict[str, str] = {}
         if hasattr(trade_manager, "state_manager") and hasattr(trade_manager.state_manager, "data"):
             open_list = trade_manager.state_manager.data.get("open_trades", [])
             for ot in open_list:
-                tid = ot.get("id") if isinstance(ot, dict) else getattr(ot, "id", None)
-                if tid:
-                    open_trade_ids.add(str(tid))
+                int_id = ot.get("id") if isinstance(ot, dict) else getattr(ot, "id", None)
+                plat_id = ot.get("platform_trade_id") if isinstance(ot, dict) else getattr(ot, "platform_trade_id", None)
+                if int_id:
+                    if plat_id:
+                        platform_to_internal[str(plat_id)] = str(int_id)
+                    platform_to_internal[str(int_id)] = str(int_id)
 
         for deal in closed_deals:
             uuid_str = str(deal.get("uuid") or "")
-            if not uuid_str or uuid_str in self._settled_deal_uuids:
+            if not uuid_str:
                 continue
 
-            if uuid_str not in open_trade_ids:
+            if uuid_str in self._settled_deal_uuids:
                 continue
+
+            if uuid_str not in platform_to_internal:
+                if uuid_str not in self._logged_unknown_deal_uuids:
+                    logger.warning("Closed deal uuid '%s' not found in open trades; skipping settlement.", uuid_str)
+                    self._logged_unknown_deal_uuids.add(uuid_str)
+                continue
+
+            internal_trade_id = platform_to_internal[uuid_str]
 
             st_raw = str(deal.get("status") or "").strip().lower()
             if st_raw in ("won", "win"):
@@ -502,17 +688,25 @@ class BinomoAdapter(PlatformAdapter):
                 raise ValueError(msg)
 
             p_rate = deal.get("payment_rate")
-            payout_val = (float(p_rate) / 100.0) if (p_rate and float(p_rate) > 1.0) else (float(p_rate) if p_rate else None)
+            if p_rate is None:
+                p_rate = deal.get("payout")
+            if p_rate is None:
+                msg = f"Deal {uuid_str} has no payment_rate or payout (never default)"
+                logger.error(msg)
+                raise ValueError(msg)
+
+            payout_val = (float(p_rate) / 100.0) if float(p_rate) > 1.0 else float(p_rate)
 
             try:
                 res = trade_manager.record_settlement(
-                    trade_id=uuid_str,
+                    trade_id=internal_trade_id,
                     outcome=outcome,
                     payout=payout_val,
                 )
                 self._settled_deal_uuids.add(uuid_str)
                 settled_results.append(res)
-                logger.info("Settlement recorded for deal %s: outcome=%s, payout=%s", uuid_str, outcome, payout_val)
+                logger.info("Settlement recorded for deal %s (internal %s): outcome=%s, payout=%s",
+                            uuid_str, internal_trade_id, outcome, payout_val)
             except Exception as exc:
                 logger.warning("Failed recording settlement for deal %s: %s", uuid_str, exc)
 
@@ -529,7 +723,7 @@ class BinomoAdapter(PlatformAdapter):
         payout: Optional[float] = None,
         trade_id: Optional[str] = None,
     ) -> TradeReceipt:
-        """Place a demo trade adhering strictly to Phase 10B rules.
+        """Place a demo trade adhering strictly to Phase 10B/10C rules.
 
         Aborts BEFORE any click on the first failure.
         Allows click interactions exclusively within this method.
@@ -551,21 +745,17 @@ class BinomoAdapter(PlatformAdapter):
             # ─────────────────────────────────────────────────────────────────
             # STEP 3a: Strict Demo & Login Agreement (Abort Before Any Click)
             # ─────────────────────────────────────────────────────────────────
-            # 1. Config mode must be demo
             config_mode = str(getattr(self.config, "mode", "")).strip().lower()
             if config_mode != "demo":
                 raise RealAccountDetected(f"Safety violation: Config mode is '{config_mode}', not 'demo'")
 
-            # 2. Session must be logged in
             if not self.session.is_logged_in():
                 raise RuntimeError("Cannot place trade: Binomo session is not logged in")
 
-            # 3. WebSocket latest balance_changed account_type must be "demo"
             ws_account_type = str(self.ws_listener.get_account_type() or "").strip().lower()
             if ws_account_type != "demo":
                 raise RealAccountDetected(f"Safety violation: WebSocket account_type is '{ws_account_type}', not 'demo'")
 
-            # 4. DOM demo_indicator must show demo
             demo_loc = resolve_locator(page, getattr(ui_cfg, "demo_indicator"))
             demo_text = ""
             if hasattr(demo_loc, "inner_text"):
@@ -582,7 +772,10 @@ class BinomoAdapter(PlatformAdapter):
             # ─────────────────────────────────────────────────────────────────
             # STEP 4: Modal / Popup Check (Never Auto-Dismiss)
             # ─────────────────────────────────────────────────────────────────
-            if is_panel_blocked(page):
+            blocking_overlays = getattr(ui_cfg, "blocking_overlays", None)
+            if blocking_overlays is None and isinstance(ui_cfg, dict):
+                blocking_overlays = ui_cfg.get("blocking_overlays")
+            if is_panel_blocked(page, blocking_overlays):
                 msg = "Trading panel is blocked by a modal dialog or popup! Aborting before click."
                 logger.critical(msg)
                 if self.alerter:
@@ -595,6 +788,8 @@ class BinomoAdapter(PlatformAdapter):
             # ─────────────────────────────────────────────────────────────────
             # STEP 3c (Validation): Expiry must exist in binomo.expiry_labels
             # ─────────────────────────────────────────────────────────────────
+            if not self.expiry_labels:
+                raise ExpiryUnavailable("Refusing to trade: binomo.expiry_labels is empty")
             if expiry_min not in self.expiry_labels:
                 raise ExpiryUnavailable(f"Expiry {expiry_min}m not available in binomo.expiry_labels {sorted(self.expiry_labels.keys())}")
             expected_expiry_label = self.expiry_labels[expiry_min]
@@ -602,7 +797,7 @@ class BinomoAdapter(PlatformAdapter):
             # ─────────────────────────────────────────────────────────────────
             # STEP 3d (Validation): Platform Currency Min/Max Limits
             # ─────────────────────────────────────────────────────────────────
-            if not self._platform_limits_loaded:
+            if not self._platform_limits_loaded or self._platform_min_stake is None or self._platform_max_stake is None:
                 self.load_platform_limits()
 
             if stake_amount < self._platform_min_stake or stake_amount > self._platform_max_stake:
@@ -611,26 +806,48 @@ class BinomoAdapter(PlatformAdapter):
                 )
 
             # ─────────────────────────────────────────────────────────────────
-            # STEP 3b: Select Asset through UI and Verify active_asset_label
+            # STEP 3b (Validation): Asset Display Name Lookup (Abort before click)
             # ─────────────────────────────────────────────────────────────────
+            display_name = self.get_display_name(asset_id)
+            if not display_name:
+                raise AssetSelectionMismatch(f"No display name found in asset table for RIC '{asset_id}'. Aborting before click.")
+
+            # ─────────────────────────────────────────────────────────────────
+            # STEP 3e (Validation): Button Labels Configured (Abort before click)
+            # ─────────────────────────────────────────────────────────────────
+            if dir_enum == TradeDirection.CALL:
+                btn_loc = resolve_locator(page, getattr(ui_cfg, "call_button"))
+                button_labels = getattr(ui_cfg, "call_button_labels", None)
+                if button_labels is None and isinstance(ui_cfg, dict):
+                    button_labels = ui_cfg.get("call_button_labels")
+                if not button_labels:
+                    raise ButtonLabelMismatch("Refusing to trade: binomo.ui.call_button_labels is empty")
+            else:
+                btn_loc = resolve_locator(page, getattr(ui_cfg, "put_button"))
+                button_labels = getattr(ui_cfg, "put_button_labels", None)
+                if button_labels is None and isinstance(ui_cfg, dict):
+                    button_labels = ui_cfg.get("put_button_labels")
+                if not button_labels:
+                    raise ButtonLabelMismatch("Refusing to trade: binomo.ui.put_button_labels is empty")
+
+            # ─────────────────────────────────────────────────────────────────
+            # UI SELECTION & EXECUTION (Allow-listed clicks exclusively here)
+            # ─────────────────────────────────────────────────────────────────
+            # 1. Select Asset through UI and verify active_asset_label
             asset_sel_loc = resolve_locator(page, getattr(ui_cfg, "asset_selector"))
             asset_sel_loc.click()
 
-            # Click asset option using template
-            asset_opt_loc = resolve_locator(page, getattr(ui_cfg, "asset_option"), name=asset_id)
+            asset_opt_loc = resolve_locator(page, getattr(ui_cfg, "asset_option"), name=display_name)
             asset_opt_loc.click()
 
-            # Verify active_asset_label
             active_asset_loc = resolve_locator(page, getattr(ui_cfg, "active_asset_label"))
             active_asset_text = (active_asset_loc.inner_text() or active_asset_loc.text_content() or "").strip()
-            if asset_id.lower() not in active_asset_text.lower():
+            if display_name.lower() not in active_asset_text.lower():
                 raise AssetSelectionMismatch(
-                    f"Active asset label '{active_asset_text}' does not match requested asset '{asset_id}'"
+                    f"Active asset label '{active_asset_text}' does not match requested asset '{asset_id}' (display name '{display_name}')"
                 )
 
-            # ─────────────────────────────────────────────────────────────────
-            # STEP 3c: Select Expiry through UI and Verify active_expiry_label
-            # ─────────────────────────────────────────────────────────────────
+            # 2. Select Expiry through UI and verify active_expiry_label
             expiry_sel_loc = resolve_locator(page, getattr(ui_cfg, "expiry_selector"))
             expiry_sel_loc.click()
 
@@ -644,9 +861,7 @@ class BinomoAdapter(PlatformAdapter):
                     f"Active expiry label '{active_exp_text}' does not match expected '{expected_expiry_label}'"
                 )
 
-            # ─────────────────────────────────────────────────────────────────
-            # STEP 3d: Enter Stake, Read Back & Compare
-            # ─────────────────────────────────────────────────────────────────
+            # 3. Enter Stake, Read Back & Compare
             amt_loc = resolve_locator(page, getattr(ui_cfg, "amount_input"))
             formatted_stake = str(int(stake_amount) if float(stake_amount).is_integer() else stake_amount)
             if hasattr(amt_loc, "fill"):
@@ -671,28 +886,30 @@ class BinomoAdapter(PlatformAdapter):
                     f"Stake amount mismatch: entered {stake_amount}, but read back {readback_num}"
                 )
 
-            # ─────────────────────────────────────────────────────────────────
-            # STEP 3e: Check Button Accessible Name & Click ONCE
-            # ─────────────────────────────────────────────────────────────────
-            if dir_enum == TradeDirection.CALL:
-                btn_loc = resolve_locator(page, getattr(ui_cfg, "call_button"))
-                expected_keyword = "call"
-            else:
-                btn_loc = resolve_locator(page, getattr(ui_cfg, "put_button"))
-                expected_keyword = "put"
-
-            btn_label = ""
+            # 4. Check Button Accessible Name / aria-label / text against allowed labels
+            btn_texts: list[str] = []
             if hasattr(btn_loc, "get_attribute"):
-                btn_label = btn_loc.get_attribute("aria-label") or ""
-            if not btn_label and hasattr(btn_loc, "inner_text"):
-                btn_label = btn_loc.inner_text() or ""
+                aria = btn_loc.get_attribute("aria-label")
+                if aria:
+                    btn_texts.append(aria)
+                name_attr = btn_loc.get_attribute("name")
+                if name_attr:
+                    btn_texts.append(name_attr)
+            if hasattr(btn_loc, "inner_text"):
+                it = btn_loc.inner_text()
+                if it:
+                    btn_texts.append(it)
+            if hasattr(btn_loc, "text_content"):
+                tc = btn_loc.text_content()
+                if tc:
+                    btn_texts.append(tc)
 
-            if expected_keyword not in btn_label.lower():
+            combined_label = " ".join(btn_texts).lower()
+            if not any(str(lbl).lower() in combined_label for lbl in button_labels):
                 raise ButtonLabelMismatch(
-                    f"Button label '{btn_label}' does not match trade direction '{dir_enum.value}'"
+                    f"Button label '{combined_label}' does not match trade direction '{dir_enum.value}' (configured labels: {button_labels})"
                 )
 
-            # Record preexisting deal uuids prior to clicking
             preexisting_uuids = {
                 str(d["uuid"])
                 for d in (self.ws_listener.get_open_deals() + self.ws_listener.get_closed_deals())
@@ -716,7 +933,6 @@ class BinomoAdapter(PlatformAdapter):
                     if not d_uuid or d_uuid in preexisting_uuids:
                         continue
 
-                    # Step 3g: deal_type other than 'demo' trips breaker immediately
                     d_type = str(deal.get("deal_type") or "").strip().lower()
                     if d_type and d_type != "demo":
                         err_msg = f"CRITICAL SAFETY BREACH: Deal {d_uuid} opened with non-demo deal_type '{d_type}'!"
@@ -730,16 +946,40 @@ class BinomoAdapter(PlatformAdapter):
                                 pass
                         raise RealAccountDetected(err_msg)
 
-                    # Check matching ric, trend, amount, and deal_type == "demo"
                     d_ric = str(deal.get("asset_ric") or deal.get("ric") or "")
                     d_trend = str(deal.get("trend") or "").strip().upper()
-                    d_amt = deal.get("amount")
-
                     expected_trends = {"CALL", "UP"} if dir_enum == TradeDirection.CALL else {"PUT", "DOWN"}
+
                     ric_matches = (d_ric.lower() == asset_id.lower() or asset_id.lower() in d_ric.lower())
                     trend_matches = (d_trend in expected_trends)
-                    amount_matches = (d_amt is not None and abs(float(d_amt) - stake_amount) < 0.01)
                     type_matches = (d_type == "demo")
+
+                    raw_amt = deal.get("raw_amount") if deal.get("raw_amount") is not None else deal.get("amount")
+                    deal_amt = deal.get("amount")
+
+                    if ric_matches and trend_matches and type_matches:
+                        # Check for amount scale suspicion on raw or deal amount
+                        for check_val in (raw_amt, deal_amt):
+                            if check_val is not None:
+                                c_float = float(check_val)
+                                is_100x = abs(c_float - (stake_amount * 100.0)) < 0.01
+                                is_div100 = abs(c_float - (stake_amount / 100.0)) < 0.0001
+                                if is_100x or is_div100:
+                                    raw_pl = deal.get("raw_payload") if isinstance(deal.get("raw_payload"), dict) else deal
+                                    logger.debug(
+                                        "Raw opened payload keys: %s, amounts: raw=%s, deal=%s, expected=%s",
+                                        list(raw_pl.keys()), raw_amt, deal_amt, stake_amount
+                                    )
+                                    alert_msg = f"amount scale suspected: raw {check_val}, expected {stake_amount}"
+                                    logger.error(alert_msg)
+                                    if self.alerter:
+                                        try:
+                                            self.alerter.send_alert(alert_msg)
+                                        except Exception:
+                                            pass
+                                    raise AmbiguousOrder(alert_msg)
+
+                    amount_matches = (deal_amt is not None and abs(float(deal_amt) - stake_amount) < 0.01)
 
                     if ric_matches and trend_matches and amount_matches and type_matches:
                         confirmed_deal = deal
@@ -756,11 +996,26 @@ class BinomoAdapter(PlatformAdapter):
                     self.breaker.trip(trip_msg)
                 raise AmbiguousOrder(trip_msg)
 
-            # Extract confirmed deal parameters
             platform_id = str(confirmed_deal.get("uuid"))
-            p_rate = confirmed_deal.get("payment_rate") or (payout * 100.0 if payout else 83.0)
+            p_rate = confirmed_deal.get("payment_rate")
+            if p_rate is None and payout is not None:
+                p_rate = payout * 100.0 if float(payout) <= 1.0 else payout
+
+            if p_rate is None or float(p_rate) <= 0:
+                err_msg = f"Deal {platform_id} confirmed but payment_rate/payout is missing"
+                logger.critical(err_msg)
+                if self.alerter:
+                    try:
+                        self.alerter.send_alert(f"🚨 {err_msg}")
+                    except Exception:
+                        pass
+                raise ValueError(err_msg)
+
             payout_dec = (float(p_rate) / 100.0) if float(p_rate) > 1.0 else float(p_rate)
             open_rate = float(confirmed_deal.get("open_rate") or 0.0)
+
+            start_ts = parse_deal_timestamp(confirmed_deal.get("created_at") or confirmed_deal.get("open_quote_created_at"))
+            entry_time = start_ts or datetime.now(timezone.utc)
 
             receipt = TradeReceipt(
                 trade_id=str(trade_id or platform_id),
@@ -769,7 +1024,7 @@ class BinomoAdapter(PlatformAdapter):
                 expiry_minutes=expiry_min,
                 stake_amount=stake_amount,
                 entry_price=open_rate,
-                entry_time=datetime.now(timezone.utc),
+                entry_time=entry_time,
                 payout=payout_dec,
                 platform_trade_id=platform_id,
                 status="OPEN",

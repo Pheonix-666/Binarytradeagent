@@ -66,7 +66,12 @@ def is_schedule_open(schedule_data: Any, now_utc: datetime) -> bool:
                 cur_time = now_utc.strftime("%H:%M")
                 matched_any = False
                 for interval in day_rules:
-                    if isinstance(interval, dict):
+                    if isinstance(interval, (list, tuple)) and len(interval) >= 2:
+                        o, c = str(interval[0]), str(interval[1])
+                        if o <= cur_time <= c:
+                            matched_any = True
+                            break
+                    elif isinstance(interval, dict):
                         o = interval.get("from") or interval.get("open")
                         c = interval.get("to") or interval.get("close")
                         if o and c and (o <= cur_time <= c):
@@ -94,6 +99,7 @@ class BinomoReadOnlySource(PriceSource):
 
         self._stopped = False
         self._request_history: list[float] = []
+        self._ric_to_name_map: dict[str, str] = {}
 
         # Rate limit and backoff settings
         self.requests_per_minute = 60
@@ -154,7 +160,22 @@ class BinomoReadOnlySource(PriceSource):
                 if not page or not hasattr(page, "request"):
                     raise RuntimeError("No active Playwright page request context available.")
 
-                response = page.request.get(url, timeout=15000)
+                headers: dict[str, str] = {}
+                if self.session and getattr(self.session, "context", None):
+                    try:
+                        cookies = {c["name"]: c["value"] for c in self.session.context.cookies()}
+                        if "authtoken" in cookies:
+                            headers["authorization-token"] = cookies["authtoken"]
+                        if "device_id" in cookies:
+                            headers["device-id"] = cookies["device_id"]
+                        headers["device-type"] = cookies.get("device_type", "web")
+                    except Exception:
+                        pass
+
+                req_kwargs: dict[str, Any] = {"timeout": 15000}
+                if headers:
+                    req_kwargs["headers"] = headers
+                response = page.request.get(url, **req_kwargs)
                 status = response.status
 
                 # Stop on 401, 403, 429 immediately without retry
@@ -189,7 +210,7 @@ class BinomoReadOnlySource(PriceSource):
 
     def get_assets(self) -> list[AssetQuote]:
         """Query /bo-assets/v7/assets and parse available assets with payout and OTC status."""
-        url = f"{self.base_api_url}/bo-assets/v7/assets"
+        url = f"{self.base_api_url}/bo-assets/v7/assets?locale=en"
         data = self._execute_get(url)
 
         asset_list: list[dict[str, Any]] = []
@@ -214,6 +235,9 @@ class BinomoReadOnlySource(PriceSource):
             name = str(item.get("name") or item.get("asset_name") or ric)
             if not ric:
                 continue
+
+            if name:
+                self._ric_to_name_map[ric] = name
 
             otc = is_otc_instrument(ric, name)
 
@@ -268,6 +292,15 @@ class BinomoReadOnlySource(PriceSource):
 
         logger.info("BinomoReadOnlySource loaded %d valid assets (option_type=%s)", len(quotes), self.option_type)
         return quotes
+
+    def get_ric_to_name_map(self) -> dict[str, str]:
+        """Return map of ric -> display name from reader's asset table."""
+        if not self._ric_to_name_map:
+            try:
+                self.get_assets()
+            except Exception:
+                pass
+        return dict(self._ric_to_name_map)
 
     # ── Closed Candles Fetching ─────────────────────────────────────────────
 
