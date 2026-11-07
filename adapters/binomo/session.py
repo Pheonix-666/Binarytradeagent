@@ -77,10 +77,6 @@ class BinomoSession:
             user_data_dir=str(self.profile_dir),
             headless=not headed,
             viewport={"width": 1366, "height": 768},
-            args=[
-                "--disable-blink-features=AutomationControlled",
-                "--no-sandbox",
-            ],
         )
 
         self._context.on("page", self._attach_page_listeners)

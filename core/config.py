@@ -515,16 +515,16 @@ class BinomoUIConfig(BaseModel):
 
     model_config = ConfigDict(extra="allow")
 
-    amount_input: Any = Field(default_factory=lambda: {"role": "spinbutton", "name": "Amount"})
-    expiry_selector: Any = Field(default_factory=lambda: {"role": "button", "name": "Expiration time"})
-    expiry_option: Any = Field(default_factory=lambda: {"role": "button", "name": "{label}"})
-    call_button: Any = Field(default_factory=lambda: {"role": "button", "name": "Call"})
-    put_button: Any = Field(default_factory=lambda: {"role": "button", "name": "Put"})
-    asset_selector: Any = Field(default_factory=lambda: {"role": "button", "name": "Asset selection"})
-    asset_option: Any = Field(default_factory=lambda: {"role": "button", "name": "{name}"})
-    demo_indicator: Any = Field(default_factory=lambda: {"role": "text", "name": "Demo account"})
-    active_asset_label: Any = Field(default_factory=lambda: {"role": "text", "name": "Active Asset"})
-    active_expiry_label: Any = Field(default_factory=lambda: {"role": "text", "name": "Active Expiry"})
+    amount_input: Any = "TODO_CALIBRATE"
+    expiry_selector: Any = "TODO_CALIBRATE"
+    expiry_option: Any = "TODO_CALIBRATE"
+    call_button: Any = "TODO_CALIBRATE"
+    put_button: Any = "TODO_CALIBRATE"
+    asset_selector: Any = "TODO_CALIBRATE"
+    asset_option: Any = "TODO_CALIBRATE"
+    demo_indicator: Any = "TODO_CALIBRATE"
+    active_asset_label: Any = "TODO_CALIBRATE"
+    active_expiry_label: Any = "TODO_CALIBRATE"
     blocking_overlays: list[str] = Field(default_factory=list)
     call_button_labels: list[str] = Field(default_factory=list)
     put_button_labels: list[str] = Field(default_factory=list)
@@ -538,7 +538,7 @@ class BinomoConfig(BaseModel):
 
     url: str = "https://binomo.com"
     profile_dir: str = "state/playwright_profile"
-    option_type: Literal["blitz", "turbo", "standard"] = "turbo"
+    option_type: Literal["blitz", "turbo", "standard", "TODO_CALIBRATE"] = "TODO_CALIBRATE"
     requests_per_minute: int = Field(ge=1, default=60)
     candle_timeframe_segments: dict[str, int] = Field(
         default_factory=lambda: {

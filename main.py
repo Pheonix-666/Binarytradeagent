@@ -353,6 +353,106 @@ def handle_check_env(args: argparse.Namespace) -> int:
     return exit_code
 
 
+def handle_binomo_validate_ui(args: argparse.Namespace) -> int:
+    """Validate Binomo UI selectors against active page without clicking, typing or filling."""
+    from adapters.binomo.session import BinomoSession
+    from adapters.binomo.trader import check_selector_spec, resolve_locator
+
+    config: AppConfig = load_config(args.config)
+    session = BinomoSession(config=config)
+    has_error = False
+
+    try:
+        page = session.start(headed=True)
+        print("Waiting for login... Please log in manually in the browser window.")
+        session.ensure_logged_in(timeout=300.0)
+
+        if not session.is_demo():
+            sys.stderr.write("ERROR: Demo account required for UI validation, but live account detected.\n")
+            return 1
+
+        ui_cfg = getattr(config.binomo, "ui", None)
+        if not ui_cfg:
+            sys.stderr.write("ERROR: Missing binomo.ui configuration.\n")
+            return 1
+
+        print("Validating Binomo UI controls...")
+
+        controls = [
+            ("amount_input", getattr(ui_cfg, "amount_input", None), {}),
+            ("expiry_selector", getattr(ui_cfg, "expiry_selector", None), {}),
+            ("call_button", getattr(ui_cfg, "call_button", None), {}),
+            ("put_button", getattr(ui_cfg, "put_button", None), {}),
+            ("asset_selector", getattr(ui_cfg, "asset_selector", None), {}),
+            ("demo_indicator", getattr(ui_cfg, "demo_indicator", None), {}),
+            ("active_asset_label", getattr(ui_cfg, "active_asset_label", None), {}),
+            ("active_expiry_label", getattr(ui_cfg, "active_expiry_label", None), {}),
+        ]
+
+        val_samples = getattr(ui_cfg, "validation_samples", {}) or {}
+        sample_exp = val_samples.get("expiry_option") or val_samples.get("expiry_label") or "1 min"
+        sample_asset = val_samples.get("asset_option") or val_samples.get("asset_name") or "EUR/USD"
+
+        templates = [
+            ("expiry_option", getattr(ui_cfg, "expiry_option", None), {"label": sample_exp}),
+            ("asset_option", getattr(ui_cfg, "asset_option", None), {"name": sample_asset}),
+        ]
+
+        active_labels = {"active_asset_label", "active_expiry_label", "demo_indicator"}
+
+        for name, spec, kwargs in controls + templates:
+            err = check_selector_spec(name, spec)
+            if err:
+                print(f"{name}: NOT FOUND ({err})")
+                has_error = True
+                continue
+
+            try:
+                loc = resolve_locator(page, spec, **kwargs)
+                cnt = loc.count() if hasattr(loc, "count") else 0
+                if cnt > 0:
+                    print(f"{name}: resolved (count {cnt})")
+                    if name in active_labels:
+                        txt = ""
+                        try:
+                            first_loc = loc.first if hasattr(loc, "first") else loc
+                            if hasattr(first_loc, "inner_text"):
+                                txt = first_loc.inner_text()
+                            elif hasattr(first_loc, "text_content"):
+                                txt = first_loc.text_content()
+                        except Exception:
+                            pass
+                        print(f"  visible text: '{txt.strip()}'")
+                else:
+                    print(f"{name}: NOT FOUND")
+                    has_error = True
+            except Exception as exc:
+                print(f"{name}: NOT FOUND ({exc})")
+                has_error = True
+
+        call_labels = getattr(ui_cfg, "call_button_labels", []) or []
+        if not call_labels or any(lbl == "TODO_CALIBRATE" for lbl in call_labels):
+            print("call_button_labels: NOT FOUND (uncalibrated or empty)")
+            has_error = True
+        else:
+            print(f"call_button_labels: resolved ({call_labels})")
+
+        put_labels = getattr(ui_cfg, "put_button_labels", []) or []
+        if not put_labels or any(lbl == "TODO_CALIBRATE" for lbl in put_labels):
+            print("put_button_labels: NOT FOUND (uncalibrated or empty)")
+            has_error = True
+        else:
+            print(f"put_button_labels: resolved ({put_labels})")
+
+    except Exception as exc:
+        sys.stderr.write(f"Validation error: {exc}\n")
+        has_error = True
+    finally:
+        session.close()
+
+    return 1 if has_error else 0
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     # Check if custom --env-file is supplied
     custom_env: Optional[str] = None
@@ -397,6 +497,10 @@ def main(argv: Optional[list[str]] = None) -> int:
     check_env_parser.add_argument("--mode", choices=["record", "paper", "demo", "live"], help="Execution mode override")
     check_env_parser.add_argument("--env-file", default=None, help="Path to custom .env file")
 
+    # Command: binomo-validate-ui
+    validate_ui_parser = subparsers.add_parser("binomo-validate-ui", help="Validate Binomo UI selectors without interacting")
+    validate_ui_parser.add_argument("--config", default="config.yaml", help="Path to config.yaml")
+
     args = parser.parse_args(argv)
 
     if args.command == "run":
@@ -409,6 +513,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         return handle_binomo_calibrate(args)
     elif args.command == "check-env":
         return handle_check_env(args)
+    elif args.command == "binomo-validate-ui":
+        return handle_binomo_validate_ui(args)
     else:
         parser.print_help()
         return 0

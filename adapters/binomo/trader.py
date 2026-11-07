@@ -108,18 +108,80 @@ def parse_deal_timestamp(val: Any) -> Optional[datetime]:
 # ── Selector Resolution & Validation Helpers ─────────────────────────────────
 
 
+# ── Valid Playwright ARIA Roles ──────────────────────────────────────────────
+
+PLAYWRIGHT_ARIA_ROLES: set[str] = {
+    "alert", "alertdialog", "application", "article", "banner", "blockquote", "button",
+    "caption", "cell", "checkbox", "code", "columnheader", "combobox", "complementary",
+    "contentinfo", "definition", "deletion", "dialog", "directory", "document", "emphasis",
+    "feed", "figure", "form", "generic", "grid", "gridcell", "group", "heading", "img",
+    "insertion", "link", "list", "listbox", "listitem", "log", "main", "marquee", "math",
+    "meter", "menu", "menubar", "menuitem", "menuitemcheckbox", "menuitemradio", "navigation",
+    "none", "note", "option", "paragraph", "presentation", "progressbar", "radio",
+    "radiogroup", "region", "row", "rowgroup", "rowheader", "scrollbar", "search",
+    "searchbox", "separator", "slider", "spinbutton", "status", "strong", "subscript",
+    "superscript", "switch", "tab", "table", "tablist", "tabpanel", "term", "textbox",
+    "time", "timer", "toolbar", "tooltip", "tree", "treegrid", "treeitem",
+}
+
+
+def check_selector_spec(key: str, spec: Any) -> Optional[str]:
+    """Check if a selector spec is uncalibrated (TODO_CALIBRATE) or has an invalid role.
+
+    Returns an error message if invalid, or None if valid.
+    """
+    if spec is None:
+        return f"{key}: missing selector spec"
+    if spec == "TODO_CALIBRATE":
+        return f"{key}: placeholder 'TODO_CALIBRATE'"
+    if isinstance(spec, str):
+        if "TODO_CALIBRATE" in spec:
+            return f"{key}: placeholder 'TODO_CALIBRATE'"
+        if not spec.strip():
+            return f"{key}: empty selector spec"
+        return None
+
+    spec_dict = spec.model_dump() if hasattr(spec, "model_dump") else spec
+    if isinstance(spec_dict, dict):
+        for k, v in spec_dict.items():
+            if v == "TODO_CALIBRATE" or (isinstance(v, str) and "TODO_CALIBRATE" in v):
+                return f"{key}: placeholder 'TODO_CALIBRATE'"
+
+        if "role" in spec_dict and spec_dict["role"]:
+            role = str(spec_dict["role"]).strip().lower()
+            if role == "text":
+                return f"{key}: invalid role 'text' (Playwright does not support role 'text'; use a css selector, test_id, or valid ARIA role)"
+            if role not in PLAYWRIGHT_ARIA_ROLES:
+                return f"{key}: invalid role '{role}' (not a valid Playwright ARIA role)"
+            return None
+
+        if "test_id" in spec_dict and spec_dict["test_id"]:
+            return None
+
+        if ("selector" in spec_dict and spec_dict["selector"]) or ("css" in spec_dict and spec_dict["css"]):
+            return None
+
+        return f"{key}: unrecognized spec format (must specify 'test_id', 'role', or 'selector'/'css')"
+
+    return f"{key}: unrecognized spec type {type(spec).__name__}"
+
+
 def resolve_locator(page: Any, spec: Any, **kwargs: Any) -> Any:
     """Resolve a selector specification into a Playwright locator.
 
     Supported spec formats:
       - dict or BaseModel with 'test_id': page.get_by_test_id(test_id)
       - dict or BaseModel with 'role' (and optional 'name'): page.get_by_role(role, name=name)
-      - dict or BaseModel with 'selector': page.locator(selector)
+      - dict or BaseModel with 'selector' or 'css': page.locator(selector)
       - str: page.locator(spec)
     Templates ({label}, {name}, etc.) are formatted using kwargs.
     """
     if spec is None:
         raise ValueError("Cannot resolve locator for None selector spec")
+
+    err = check_selector_spec("selector", spec)
+    if err:
+        raise SelectorResolutionError(f"Cannot resolve locator: {err}")
 
     spec_dict: dict[str, Any] = {}
     if hasattr(spec, "model_dump"):
@@ -139,7 +201,7 @@ def resolve_locator(page: Any, spec: Any, **kwargs: Any) -> Any:
         return page.locator(f"[data-testid='{tid}']")
 
     if "role" in spec_dict and spec_dict["role"]:
-        role = str(spec_dict["role"])
+        role = str(spec_dict["role"]).strip().lower()
         name = spec_dict.get("name")
         if name:
             name_str = str(name)
@@ -152,19 +214,21 @@ def resolve_locator(page: Any, spec: Any, **kwargs: Any) -> Any:
             return page.get_by_role(role)
         return page.locator(f"[role='{role}']")
 
-    if "selector" in spec_dict and spec_dict["selector"]:
-        sel = str(spec_dict["selector"])
+    sel = spec_dict.get("selector") or spec_dict.get("css")
+    if sel:
+        sel_str = str(sel)
         if kwargs:
-            sel = sel.format(**kwargs)
-        return page.locator(sel)
+            sel_str = sel_str.format(**kwargs)
+        return page.locator(sel_str)
 
     raise ValueError(f"Unrecognized selector spec format: {spec}")
 
 
 def validate_ui_selectors(page: Any, ui_config: Any) -> list[str]:
-    """Validate that every required selector resolves on the page.
+    """Validate that every required selector in binomo.ui is calibrated and resolves on page.
 
-    Returns a list of failed selector names (empty if all resolved).
+    Refuses to run if any TODO_CALIBRATE placeholder or invalid role remains, naming each one.
+    Returns a list of failed selector descriptions (empty if all resolved).
     """
     failed: list[str] = []
 
@@ -183,18 +247,20 @@ def validate_ui_selectors(page: Any, ui_config: Any) -> list[str]:
         spec = getattr(ui_config, key, None)
         if spec is None and isinstance(ui_config, dict):
             spec = ui_config.get(key)
-        if spec is None:
-            failed.append(key)
+
+        err = check_selector_spec(key, spec)
+        if err:
+            failed.append(err)
             continue
 
         try:
             loc = resolve_locator(page, spec)
             count = loc.count() if hasattr(loc, "count") else 1
             if count == 0:
-                failed.append(key)
+                failed.append(f"{key}: not found on page (count 0)")
         except Exception as exc:
             logger.debug("Selector '%s' failed resolution check: %s", key, exc)
-            failed.append(key)
+            failed.append(f"{key}: resolution error ({exc})")
 
     # Template selectors: verify formatting and resolution syntax using config samples
     val_samples = getattr(ui_config, "validation_samples", {}) or {}
@@ -204,42 +270,48 @@ def validate_ui_selectors(page: Any, ui_config: Any) -> list[str]:
     sample_exp = val_samples.get("expiry_option") or val_samples.get("expiry_label")
     sample_asset = val_samples.get("asset_option") or val_samples.get("asset_name")
 
-    if not sample_exp:
-        failed.append("validation_samples.expiry_option")
-    if not sample_asset:
-        failed.append("validation_samples.asset_option")
+    if not sample_exp or sample_exp == "TODO_CALIBRATE":
+        failed.append("validation_samples.expiry_option: missing or TODO_CALIBRATE")
+    if not sample_asset or sample_asset == "TODO_CALIBRATE":
+        failed.append("validation_samples.asset_option: missing or TODO_CALIBRATE")
 
     templates: list[tuple[str, dict[str, str]]] = []
-    if sample_exp:
+    if sample_exp and sample_exp != "TODO_CALIBRATE":
         templates.append(("expiry_option", {"label": sample_exp}))
-    if sample_asset:
+    if sample_asset and sample_asset != "TODO_CALIBRATE":
         templates.append(("asset_option", {"name": sample_asset}))
 
     for key, sample_kwargs in templates:
         spec = getattr(ui_config, key, None)
         if spec is None and isinstance(ui_config, dict):
             spec = ui_config.get(key)
-        if spec is None:
-            failed.append(key)
+
+        err = check_selector_spec(key, spec)
+        if err:
+            failed.append(err)
             continue
         try:
             resolve_locator(page, spec, **sample_kwargs)
         except Exception as exc:
             logger.debug("Template selector '%s' failed validation: %s", key, exc)
-            failed.append(key)
+            failed.append(f"{key}: template resolution error ({exc})")
 
     # Validate button label lists
     call_labels = getattr(ui_config, "call_button_labels", None)
     if call_labels is None and isinstance(ui_config, dict):
         call_labels = ui_config.get("call_button_labels")
     if not call_labels:
-        failed.append("call_button_labels")
+        failed.append("call_button_labels: empty list (refuse to trade)")
+    elif any(lbl == "TODO_CALIBRATE" for lbl in call_labels):
+        failed.append("call_button_labels: contains placeholder 'TODO_CALIBRATE'")
 
     put_labels = getattr(ui_config, "put_button_labels", None)
     if put_labels is None and isinstance(ui_config, dict):
         put_labels = ui_config.get("put_button_labels")
     if not put_labels:
-        failed.append("put_button_labels")
+        failed.append("put_button_labels: empty list (refuse to trade)")
+    elif any(lbl == "TODO_CALIBRATE" for lbl in put_labels):
+        failed.append("put_button_labels: contains placeholder 'TODO_CALIBRATE'")
 
     # Validate blocking overlays list
     overlays = getattr(ui_config, "blocking_overlays", None)
@@ -452,8 +524,16 @@ class BinomoAdapter(PlatformAdapter):
             raise SelectorResolutionError("Missing binomo.ui configuration block")
 
         failed = validate_ui_selectors(target_page, ui_cfg)
+
+        if self.config and hasattr(self.config, "binomo"):
+            b_cfg = self.config.binomo
+            if getattr(b_cfg, "option_type", None) == "TODO_CALIBRATE":
+                failed.append("binomo.option_type: placeholder 'TODO_CALIBRATE'")
+            if not getattr(b_cfg, "expiry_labels", None):
+                failed.append("binomo.expiry_labels: empty (refuse to trade)")
+
         if failed:
-            msg = f"Startup refused: binomo.ui selectors failed to resolve on page: {failed}"
+            msg = f"Startup refused: binomo.ui selectors uncalibrated or failed to resolve on page: {failed}"
             logger.critical(msg)
             if self.alerter:
                 try:

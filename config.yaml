@@ -258,7 +258,7 @@ adaptive:
 binomo:
   url: "https://binomo.com"
   profile_dir: "state/playwright_profile"
-  option_type: "turbo"          # blitz | turbo | standard
+  option_type: "TODO_CALIBRATE"          # blitz | turbo | standard
   requests_per_minute: 60
   candle_timeframe_segments:
     "1m": 60
@@ -271,57 +271,21 @@ binomo:
   max_frame_age_seconds: 60.0
   limits_product: "binary_option"
   amount_scale: 1.0
-  expiry_labels:
-    1: "1 min"
-    5: "5 min"
-    15: "15 min"
-    30: "30 min"
-    60: "60 min"
+  expiry_labels: {}
   ui:
-    amount_input:
-      role: "spinbutton"
-      name: "Amount"
-    expiry_selector:
-      role: "button"
-      name: "Expiration time"
-    expiry_option:
-      role: "button"
-      name: "{label}"
-    call_button:
-      role: "button"
-      name: "Call"
-    put_button:
-      role: "button"
-      name: "Put"
-    asset_selector:
-      role: "button"
-      name: "Asset selection"
-    asset_option:
-      role: "button"
-      name: "{name}"
-    demo_indicator:
-      role: "text"
-      name: "Demo account"
-    active_asset_label:
-      role: "text"
-      name: "Active Asset"
-    active_expiry_label:
-      role: "text"
-      name: "Active Expiry"
-    blocking_overlays:
-      - "[role='dialog']"
-      - ".modal-dialog"
-      - ".popup-container"
-      - ".blocking-modal"
-      - ".dialog-overlay"
+    amount_input: "TODO_CALIBRATE"
+    expiry_selector: "TODO_CALIBRATE"
+    expiry_option: "TODO_CALIBRATE"
+    call_button: "TODO_CALIBRATE"
+    put_button: "TODO_CALIBRATE"
+    asset_selector: "TODO_CALIBRATE"
+    asset_option: "TODO_CALIBRATE"
+    demo_indicator: "TODO_CALIBRATE"
+    active_asset_label: "TODO_CALIBRATE"
+    active_expiry_label: "TODO_CALIBRATE"
+    blocking_overlays: []
     call_button_labels:
-      - "call"
-      - "up"
-      - "higher"
+      - "TODO_CALIBRATE"
     put_button_labels:
-      - "put"
-      - "down"
-      - "lower"
-    validation_samples:
-      expiry_option: "1 min"
-      asset_option: "Crypto IDX"
+      - "TODO_CALIBRATE"
+    validation_samples: {}

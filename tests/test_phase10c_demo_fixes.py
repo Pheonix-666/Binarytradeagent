@@ -191,6 +191,12 @@ class FakePage:
     def locator(self, selector: str) -> FakeLocator:
         if any(m in selector for m in ("dialog", "modal", "popup", "overlay")):
             return FakeLocator(name="modal", count=1 if self.dialog_visible else 0, visible=self.dialog_visible)
+        if selector == ".demo-indicator" and "role:text:Demo account" in self.locators:
+            return self.locators["role:text:Demo account"]
+        if selector == ".active-asset" and "role:text:Active Asset" in self.locators:
+            return self.locators["role:text:Active Asset"]
+        if selector == ".active-expiry" and "role:text:Active Expiry" in self.locators:
+            return self.locators["role:text:Active Expiry"]
         if selector in self.locators:
             return self.locators[selector]
         loc = FakeLocator(name=selector, count=1)
@@ -202,6 +208,21 @@ def build_test_ui(asset_display_name: str = "EUR/USD", expiry_label: str = "1 mi
     cfg = load_config("config.yaml")
     cfg.mode = "demo"
     cfg.binomo.confirm_timeout_seconds = 0.5
+    cfg.binomo.option_type = "turbo"
+    cfg.binomo.expiry_labels = {1: "1 min", 5: "5 min", 15: "15 min", 30: "30 min", 60: "60 min"}
+    cfg.binomo.ui.amount_input = {"role": "spinbutton", "name": "Amount"}
+    cfg.binomo.ui.expiry_selector = {"role": "button", "name": "Expiration time"}
+    cfg.binomo.ui.expiry_option = {"role": "button", "name": "{label}"}
+    cfg.binomo.ui.call_button = {"role": "button", "name": "Call"}
+    cfg.binomo.ui.put_button = {"role": "button", "name": "Put"}
+    cfg.binomo.ui.asset_selector = {"role": "button", "name": "Asset selection"}
+    cfg.binomo.ui.asset_option = {"role": "button", "name": "{name}"}
+    cfg.binomo.ui.demo_indicator = {"selector": ".demo-indicator"}
+    cfg.binomo.ui.active_asset_label = {"selector": ".active-asset"}
+    cfg.binomo.ui.active_expiry_label = {"selector": ".active-expiry"}
+    cfg.binomo.ui.call_button_labels = ["call", "up", "higher"]
+    cfg.binomo.ui.put_button_labels = ["put", "down", "lower"]
+    cfg.binomo.ui.validation_samples = {"expiry_option": "1 min", "asset_option": "EUR/USD"}
 
     locs: dict[str, FakeLocator] = {
         "role:spinbutton:Amount": FakeLocator("amount_input", count=1, value=str(int(stake))),
@@ -211,9 +232,9 @@ def build_test_ui(asset_display_name: str = "EUR/USD", expiry_label: str = "1 mi
         "role:button:Put": FakeLocator("put_btn", count=1, text="Put", aria_label="Put"),
         "role:button:Asset selection": FakeLocator("asset_sel", count=1),
         f"role:button:{asset_display_name}": FakeLocator("asset_opt", count=1, text=asset_display_name),
-        "role:text:Demo account": FakeLocator("demo_indicator", count=1, text="Demo account"),
-        "role:text:Active Asset": FakeLocator("active_asset_label", count=1, text=asset_display_name),
-        "role:text:Active Expiry": FakeLocator("active_expiry_label", count=1, text=expiry_label),
+        ".demo-indicator": FakeLocator("demo_indicator", count=1, text="Demo account"),
+        ".active-asset": FakeLocator("active_asset_label", count=1, text=asset_display_name),
+        ".active-expiry": FakeLocator("active_expiry_label", count=1, text=expiry_label),
     }
 
     page = FakePage(locators=locs)
